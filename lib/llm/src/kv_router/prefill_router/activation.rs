@@ -101,6 +101,29 @@ fn resolve_advertisement_from_cards(
     Ok(advertisement)
 }
 
+/// KV tuning for the prefill hop: the prefill card's when it declares any, else
+/// the decode set's. A card that declares a mode may declare KV tuning alongside
+/// it; honoring only half of its `RouterConfig` would be a trap.
+///
+/// Whichever config wins, the hop tracks neither active nor output blocks:
+/// prefill routing is prompt-side, and crediting decode blocks here would
+/// double-count load. The policy file's `router` settings are finalized first,
+/// because the KV router applies them again and would turn both back on.
+fn prefill_kv_config(
+    advertised: Option<KvRouterConfig>,
+    inherited: Option<KvRouterConfig>,
+) -> Result<Option<KvRouterConfig>> {
+    let Some(mut config) = advertised.or(inherited) else {
+        return Ok(None);
+    };
+    config
+        .finalize_policy_config()
+        .map_err(anyhow::Error::msg)?;
+    config.router_track_active_blocks = false;
+    config.router_track_output_blocks = false;
+    Ok(Some(config))
+}
+
 impl PrefillRouter {
     /// Create a disabled prefill router that will never activate (passthrough only)
     pub fn disabled(
@@ -338,18 +361,9 @@ impl PrefillRouter {
         )
         .await?;
 
-        // A prefill card that declares a mode may declare KV tuning alongside it;
-        // honoring only half of its `RouterConfig` would be a trap. Whichever
-        // config wins, `router_track_active_blocks` stays off: prefill routing is
-        // prompt-side, and crediting decode blocks here would double-count load.
         let advertised_kv_tuning = advertisement.kv_router_config.is_some();
-        let prefill_kv_config = match advertisement.kv_router_config {
-            Some(mut advertised) => {
-                advertised.router_track_active_blocks = false;
-                Some(advertised)
-            }
-            None => kv_router_config,
-        };
+        let prefill_kv_config =
+            prefill_kv_config(advertisement.kv_router_config, kv_router_config)?;
 
         // Logged once per activation, and deliberately the *resolved* values
         // rather than what the card asked for. An advertisement replaces the
@@ -749,6 +763,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prefill_hop_never_tracks_output_blocks() {
+        let by_flag = KvRouterConfig {
+            router_track_output_blocks: true,
+            ..Default::default()
+        };
+        let policy_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            policy_file.path(),
+            "router:\n  router_track_output_blocks: true\n",
+        )
+        .unwrap();
+        let mut by_policy_file = KvRouterConfig {
+            router_policy_config: Some(policy_file.path().display().to_string()),
+            ..Default::default()
+        };
+        by_policy_file.apply_policy_config().unwrap();
+        // A silent pool gets the frontend's config with active blocks already off.
+        let handed_down = |frontend: &KvRouterConfig| KvRouterConfig {
+            router_track_active_blocks: false,
+            ..frontend.clone()
+        };
+        for (case, advertised, inherited) in [
+            ("inherited, set by flag", None, Some(handed_down(&by_flag))),
+            (
+                "inherited, set in the policy file",
+                None,
+                Some(handed_down(&by_policy_file)),
+            ),
+            ("advertised", Some(by_flag), None),
+        ] {
+            let mut resolved = prefill_kv_config(advertised, inherited)
+                .unwrap()
+                .expect("KV config");
+            // The KV router applies the policy file again, then validates. An
+            // invalid config keeps the hop from ever activating.
+            resolved.apply_policy_config().unwrap();
+            assert_eq!(resolved.validate(), Ok(()), "{case}");
+            assert!(!resolved.router_track_active_blocks, "{case}");
+            assert!(!resolved.router_track_output_blocks, "{case}");
+        }
+    }
+
     struct PrefillWorker(u32, Option<Arc<AtomicUsize>>);
 
     #[async_trait::async_trait]
@@ -933,9 +990,10 @@ mod tests {
             .iter()
             .map(|worker| worker.instance().id())
             .collect();
+        // What a prefill worker started with `--router-track-output-blocks` advertises.
         let kv_config = KvRouterConfig {
             use_kv_events: false,
-            router_track_active_blocks: false,
+            router_track_output_blocks: true,
             ..Default::default()
         };
         let group_id = endpoint.id().to_string();
@@ -1231,13 +1289,24 @@ mod tests {
             .start_with_registration()
             .await
             .unwrap();
-        let kv_config = KvRouterConfig {
+        // The prefill pool advertises nothing, so the hop inherits the frontend's
+        // config: its policy file turns block tracking on, and the frontend hands
+        // the config down with active blocks off.
+        let policy_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            policy_file.path(),
+            "router:\n  router_track_active_blocks: true\n  router_track_output_blocks: true\n",
+        )
+        .unwrap();
+        let mut kv_config = KvRouterConfig {
             use_kv_events: false,
-            router_track_active_blocks: false,
+            router_policy_config: Some(policy_file.path().display().to_string()),
             ..Default::default()
         };
-        let mut advertised = card(Some(RouterConfig::new(RouterMode::KV, kv_config)));
-        advertised.kv_cache_block_size = 64;
+        kv_config.apply_policy_config().unwrap();
+        kv_config.router_track_active_blocks = false;
+        let mut silent = card(None);
+        silent.kv_cache_block_size = 64;
         worker_runtime
             .discovery()
             .register(
@@ -1245,7 +1314,7 @@ mod tests {
                     namespace.clone(),
                     "workers".into(),
                     "prefill".into(),
-                    &advertised,
+                    &silent,
                 )
                 .unwrap(),
             )
@@ -1264,7 +1333,7 @@ mod tests {
             RouterMode::KV,
             false,
             64,
-            None,
+            Some(kv_config),
             SelectionPolicySource::Registry,
             None,
             None,
@@ -1280,7 +1349,7 @@ mod tests {
             group: endpoint.id().to_string(),
             endpoint,
             generation: 1,
-            card: Arc::new(advertised),
+            card: Arc::new(silent),
             admitted_ids,
         })));
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1290,6 +1359,16 @@ mod tests {
         })
         .await
         .expect("prefill target must activate");
+        let binding = router.binding.load_full().unwrap();
+        let hop_config = binding
+            .router
+            .kv_router_if_enabled()
+            .expect("the hop inherits KV mode")
+            .kv_router_config();
+        assert!(
+            !hop_config.router_track_active_blocks && !hop_config.router_track_output_blocks,
+            "the policy file must not turn block tracking back on for the prefill hop"
+        );
 
         // Exercise the production generate path, discovery, TCP dispatch, and
         // cancellation propagation for all output modes and both refusal paths.
