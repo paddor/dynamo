@@ -420,6 +420,7 @@ pub enum ValidatedZmqSourceError {
 }
 
 /// A direct ZMQ source that validates frame and envelope attribution once.
+/// TCP sources use native OMQ sockets and interoperate with existing publishers.
 pub struct ValidatedZmqSource {
     stream: ZmqWireStream,
     expected_topic: String,
@@ -442,9 +443,14 @@ impl ValidatedZmqSource {
         expected_publisher_id: u64,
         rcvhwm: i32,
     ) -> Result<Self> {
+        let stream = if endpoint.starts_with("tcp://") {
+            connect_omq_tcp_subscriber(endpoint, topic, rcvhwm).await?
+        } else {
+            // inproc publishers require the same libzmq context as their subscribers.
+            ZmqSubTransport::connect_single_consumer_with_rcvhwm(endpoint, topic, rcvhwm).await?
+        };
         Ok(Self {
-            stream: ZmqSubTransport::connect_single_consumer_with_rcvhwm(endpoint, topic, rcvhwm)
-                .await?,
+            stream,
             expected_topic: topic.to_string(),
             expected_publisher_id,
             codec: Codec::default(),
@@ -488,6 +494,46 @@ impl ValidatedZmqSource {
             payload: envelope.payload,
         }))
     }
+}
+
+async fn connect_omq_tcp_subscriber(
+    endpoint: &str,
+    topic: &str,
+    rcvhwm: i32,
+) -> Result<ZmqWireStream> {
+    anyhow::ensure!(rcvhwm > 0, "ZMQ receive HWM must be greater than zero");
+    ipv6_option_for(endpoint)?;
+    let options = omq_tokio::Options::default().recv_hwm(rcvhwm as u32);
+    let socket = omq_tokio::Socket::try_new(omq_tokio::SocketType::Sub, options)?;
+    let expected_topic = Bytes::copy_from_slice(topic.as_bytes());
+    socket.subscribe(expected_topic.clone()).await?;
+    socket
+        .connect(endpoint)
+        .await
+        .with_context(|| format!("Failed to connect ZMQ socket to {endpoint}"))?;
+    tracing::info!(
+        endpoint,
+        topic,
+        rcvhwm,
+        "ZMQ single-consumer stream connected with OMQ"
+    );
+
+    Ok(Box::pin(stream! {
+        loop {
+            let frames = match socket.recv().await {
+                Ok(frames) => frames,
+                Err(error) => {
+                    yield Err(error.into());
+                    break;
+                }
+            };
+            tokio::task::consume_budget().await;
+            match decode_omq_multipart(frames, &expected_topic) {
+                Ok(message) => yield Ok(message),
+                Err(error) => tracing::warn!(%error, "Dropping malformed ZMQ message"),
+            }
+        }
+    }))
 }
 
 impl ZmqSubTransport {
@@ -687,36 +733,70 @@ impl ZmqSubTransport {
 }
 
 fn decode_multipart(mut frames: Multipart, expected_topic: &[u8]) -> Result<ZmqWireMessage> {
-    if frames.len() != 4 {
-        anyhow::bail!("unexpected ZMQ multipart frame count: {}", frames.len());
-    }
-
-    if !expected_topic.is_empty() && &frames[0][..] != expected_topic {
-        anyhow::bail!("ZMQ message topic disagrees with the exact subscription topic");
-    }
-
-    let publisher_id_bytes = &frames[1];
-    if publisher_id_bytes.len() != 8 {
-        anyhow::bail!(
-            "invalid ZMQ publisher ID frame length: {}",
-            publisher_id_bytes.len()
-        );
-    }
-    let publisher_id = u64::from_be_bytes(publisher_id_bytes[..].try_into().unwrap());
-
-    let sequence_bytes = &frames[2];
-    if sequence_bytes.len() != 8 {
-        anyhow::bail!(
-            "invalid ZMQ sequence frame length: {}",
-            sequence_bytes.len()
-        );
-    }
-    let sequence = u64::from_be_bytes(sequence_bytes[..].try_into().unwrap());
-
+    let (publisher_id, sequence) =
+        decode_wire_headers(frames.len(), expected_topic, |index| &frames[index][..])?;
     let frame_message = frames
         .pop_back()
         .ok_or_else(|| anyhow!("ZMQ multipart message has no payload frame"))?;
-    let frame_bytes = Bytes::from_owner(ZmqMessageOwner(frame_message));
+    decode_wire_payload(
+        publisher_id,
+        sequence,
+        Bytes::from_owner(ZmqMessageOwner(frame_message)),
+    )
+}
+
+fn decode_omq_multipart(
+    frames: omq_tokio::Message,
+    expected_topic: &[u8],
+) -> Result<ZmqWireMessage> {
+    let (publisher_id, sequence) =
+        decode_wire_headers(frames.len(), expected_topic, |index| &frames[index])?;
+    let payload = frames
+        .last_payload()
+        .ok_or_else(|| anyhow!("ZMQ multipart message has no payload frame"))?;
+    decode_wire_payload(publisher_id, sequence, payload.into_bytes())
+}
+
+fn decode_wire_headers<'a>(
+    frame_count: usize,
+    expected_topic: &[u8],
+    frame: impl Fn(usize) -> &'a [u8],
+) -> Result<(u64, u64)> {
+    if frame_count != 4 {
+        anyhow::bail!("unexpected ZMQ multipart frame count: {frame_count}");
+    }
+    if !expected_topic.is_empty() && frame(0) != expected_topic {
+        anyhow::bail!("ZMQ message topic disagrees with the exact subscription topic");
+    }
+
+    let publisher_id_bytes = frame(1);
+    let publisher_id = publisher_id_bytes
+        .try_into()
+        .map(u64::from_be_bytes)
+        .map_err(|_| {
+            anyhow!(
+                "invalid ZMQ publisher ID frame length: {}",
+                publisher_id_bytes.len()
+            )
+        })?;
+    let sequence_bytes = frame(2);
+    let sequence = sequence_bytes
+        .try_into()
+        .map(u64::from_be_bytes)
+        .map_err(|_| {
+            anyhow!(
+                "invalid ZMQ sequence frame length: {}",
+                sequence_bytes.len()
+            )
+        })?;
+    Ok((publisher_id, sequence))
+}
+
+fn decode_wire_payload(
+    publisher_id: u64,
+    sequence: u64,
+    frame_bytes: Bytes,
+) -> Result<ZmqWireMessage> {
     let frame = Frame::decode(frame_bytes)?;
 
     Ok(ZmqWireMessage {
@@ -1058,6 +1138,108 @@ mod tests {
         let payload_ptr = envelope.payload.as_ptr() as usize;
         assert!((encoded_start..encoded_end).contains(&payload_ptr));
         assert!(source.next().await.is_none());
+    }
+
+    #[test]
+    fn omq_wire_decode_preserves_payload_storage() {
+        let framed = Frame::new(Bytes::from(vec![7; 512])).encode();
+        let expected = Frame::decode(framed.clone()).unwrap().payload;
+        let frames = omq_tokio::Message::multipart([
+            Bytes::from_static(b"kv"),
+            Bytes::copy_from_slice(&7u64.to_be_bytes()),
+            Bytes::copy_from_slice(&12u64.to_be_bytes()),
+            framed,
+        ]);
+
+        let message = decode_omq_multipart(frames, b"kv").unwrap();
+        assert_eq!(message.publisher_id, 7);
+        assert_eq!(message.sequence, 12);
+        assert_eq!(message.payload, expected);
+        assert_eq!(message.payload.as_ptr(), expected.as_ptr());
+    }
+
+    #[tokio::test]
+    async fn omq_tcp_source_validates_libzmq_publisher_frames() {
+        let topic = "kv";
+        let (publisher, endpoint) = ZmqPubTransport::bind("tcp://127.0.0.1:*", topic)
+            .await
+            .unwrap();
+        let endpoint = endpoint.replace("127.0.0.1", "localhost");
+        assert!(
+            ValidatedZmqSource::connect(&endpoint, topic, 7, 0)
+                .await
+                .is_err()
+        );
+        let mut source = ValidatedZmqSource::connect(&endpoint, topic, 7, 37)
+            .await
+            .unwrap();
+        let codec = Codec::default();
+        let anchor = codec
+            .encode_envelope_parts(7, 0, 11, topic, b"anchor")
+            .unwrap();
+
+        let first = timeout(Duration::from_secs(3), async {
+            loop {
+                publisher.publish(topic, anchor.clone()).await.unwrap();
+                if let Ok(message) = timeout(Duration::from_millis(25), source.next()).await {
+                    break message.unwrap().unwrap();
+                }
+            }
+        })
+        .await
+        .expect("OMQ subscriber should receive a libzmq publication");
+        assert_eq!(first.payload, Bytes::from_static(b"anchor"));
+
+        let valid = codec
+            .encode_envelope_parts(7, 2, 12, topic, b"valid")
+            .unwrap();
+        let mismatch = codec
+            .encode_envelope_parts(8, 1, 12, topic, b"mismatch")
+            .unwrap();
+        send_raw(&publisher, vec![topic.as_bytes().to_vec()]).await;
+        send_raw(
+            &publisher,
+            vec![
+                b"kv-prefix".to_vec(),
+                7u64.to_be_bytes().to_vec(),
+                2u64.to_be_bytes().to_vec(),
+                Frame::new(valid.clone()).encode().to_vec(),
+            ],
+        )
+        .await;
+        send_raw(
+            &publisher,
+            vec![
+                topic.as_bytes().to_vec(),
+                7u64.to_be_bytes().to_vec(),
+                1u64.to_be_bytes().to_vec(),
+                Frame::new(mismatch).encode().to_vec(),
+            ],
+        )
+        .await;
+        publisher.publish(topic, valid).await.unwrap();
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                match source.next().await.unwrap() {
+                    Ok(envelope) if envelope.sequence == 0 => continue,
+                    Err(ValidatedZmqSourceError::IdentityMismatch { .. }) => break,
+                    result => panic!("expected a publisher identity mismatch, got {result:?}"),
+                }
+            }
+            let envelope = source.next().await.unwrap().unwrap();
+            assert_eq!(
+                (
+                    envelope.publisher_id,
+                    envelope.sequence,
+                    envelope.published_at
+                ),
+                (7, 2, 12)
+            );
+            assert_eq!(envelope.payload, Bytes::from_static(b"valid"));
+        })
+        .await
+        .expect("valid TCP stream should continue after rejected frames");
     }
 
     #[tokio::test]
