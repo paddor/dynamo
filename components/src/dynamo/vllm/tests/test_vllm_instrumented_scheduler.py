@@ -30,10 +30,10 @@ from itertools import count
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
+import pyomq as zmq
 import pytest
 import torch
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-import zmq
 from vllm.config import CUDAGraphMode  # noqa: E402
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
@@ -10509,11 +10509,9 @@ def test_fpm_utility_via_vllm_dispatch_retargets_active_and_heartbeat_ids():
     """Through vLLM's own utility dispatch, both FPM payload kinds carry the new id."""
     import queue
 
-    import zmq
+    from dynamo.common.forward_pass_metrics import decode
     from vllm.v1.engine import EngineCoreRequestType
     from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
-
-    from dynamo.common.forward_pass_metrics import decode
 
     ctx = zmq.Context.instance()
     # Keep publishing paused until the subscriber connects and the worker ID is set.

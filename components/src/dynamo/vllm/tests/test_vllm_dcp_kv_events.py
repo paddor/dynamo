@@ -6,10 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import msgspec
+import pyomq as zmq
 import pytest
 import pytest_asyncio
-import zmq
-import zmq.asyncio
+from pyomq import asyncio as zmq_asyncio
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm.v1.core.kv_cache_manager")
@@ -132,7 +132,7 @@ async def test_dcp_events_match_configured_block_size(monkeypatch, runtime):
         worker_type=WorkerType.Aggregated,
         runtime_config=runtime_config,
     )
-    with zmq.asyncio.Context() as context, context.socket(zmq.XPUB) as socket:
+    with zmq_asyncio.Context() as context, context.socket(zmq.XPUB) as socket:
         socket.setsockopt(zmq.LINGER, 0)
         port = socket.bind_to_random_port("tcp://127.0.0.1")
         publisher = KvEventPublisher(

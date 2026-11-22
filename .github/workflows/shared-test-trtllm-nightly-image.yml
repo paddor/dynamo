@@ -98,6 +98,12 @@ jobs:
         if: matrix.scenario == 'video'
         run: >-
           python3 components/src/dynamo/common/utils/install_media_decoders.py trtllm
+      - name: Install OMQ for the routing test subscriber
+        if: matrix.scenario == 'image-routing'
+        run: >-
+          python3 -m pip install --no-deps
+          "pyomq==0.21.0; python_version < '3.12'"
+          "pyomq==0.29.0; python_version >= '3.12'"
       - name: Run live ${{ matrix.scenario }} integration test
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}

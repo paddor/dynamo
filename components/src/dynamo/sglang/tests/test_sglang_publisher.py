@@ -6,12 +6,11 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-import pytest
-import zmq
-
 import dynamo.sglang._compat as sglang_compat
 import dynamo.sglang._disagg as disagg_mod
 import dynamo.sglang.publisher as publisher_mod
+import pyomq as zmq
+import pytest
 from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY, get_sglang_worker_group_id
 from dynamo.sglang.nixl_telemetry import _share_scheduler_metrics_ipc_name
 from dynamo.sglang.publisher import (
@@ -25,6 +24,7 @@ from dynamo.sglang.publisher import (
     set_forward_pass_metrics_worker_id,
     setup_sgl_metrics,
 )
+from pyomq import asyncio as zmq_asyncio
 
 pytestmark = [
     pytest.mark.unit,
@@ -1230,15 +1230,12 @@ def _publisher_with_sockets(sock, fanout, owner, stop_after_publish):
 
 @pytest.mark.asyncio
 async def test_metrics_fanout_reaches_sibling_gateways(tmp_path, monkeypatch):
-    import zmq
-    import zmq.asyncio
-
     monkeypatch.setattr(
         publisher_mod, "kv_metrics_block_values", lambda metrics, page_size: (7, 100)
     )
     metrics_ep = f"ipc://{tmp_path}/metrics"
     fanout_ep = f"ipc://{tmp_path}/fanout"
-    ctx = zmq.asyncio.Context()
+    ctx = zmq_asyncio.Context()
     sockets = []
     try:
         owner_sock, fanout = publisher_mod._open_metrics_sockets(

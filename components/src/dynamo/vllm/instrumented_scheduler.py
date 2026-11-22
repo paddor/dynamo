@@ -117,7 +117,7 @@ from typing import TYPE_CHECKING, Any, cast
 import msgspec.structs
 import vllm
 import vllm.envs as vllm_envs
-import zmq
+import pyomq as zmq
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
@@ -1104,7 +1104,7 @@ class _BenchmarkSynchronizer:
             min(int(timeout * 1000), self.MAX_SYNC_TIMEOUT_SECONDS * 1000),
         )
         self._run_id = uuid.uuid4().hex if dp_rank == 0 else None
-        self._ctx = zmq.Context.instance()
+        self._ctx = zmq.Context()
 
         if dp_rank == 0:
             self._socket = self._ctx.socket(zmq.ROUTER)
@@ -1139,6 +1139,7 @@ class _BenchmarkSynchronizer:
             else 0
         )
         self._socket.close(linger=linger)
+        self._ctx.term()
 
     def negotiate_capacity(
         self, local_capacity: _BenchmarkCapacityEnvelope
@@ -2150,7 +2151,7 @@ class _FpmPublisherThread:
         self._heartbeat_lock = threading.Lock()
         self._heartbeat_state = (QueuedRequestMetrics(), False)
 
-        self._ctx = zmq.Context.instance()
+        self._ctx = zmq.Context()
         self._pub = self._ctx.socket(zmq.PUB)
         self._pub.bind(endpoint)
         # Read socket metadata before the publisher thread takes ownership.
@@ -2195,6 +2196,7 @@ class _FpmPublisherThread:
         self._thread.join(timeout=self.SHUTDOWN_TIMEOUT)
         try:
             self._pub.close(linger=0)
+            self._ctx.term()
         except Exception:
             pass
 

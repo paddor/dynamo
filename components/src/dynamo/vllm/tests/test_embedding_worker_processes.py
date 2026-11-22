@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-import zmq
+import pyomq as zmq
 
 pytest.importorskip("vllm.usage.usage_lib")
 

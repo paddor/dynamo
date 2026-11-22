@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from time import monotonic
 from typing import (
     TYPE_CHECKING,
@@ -19,9 +20,10 @@ from typing import (
 )
 from urllib.parse import urlparse
 
+import pyomq as zmq
+from pyomq import asyncio as zmq_asyncio
+
 import sglang as sgl
-import zmq
-import zmq.asyncio
 from sglang.srt.disaggregation.kv_events import ZmqEventPublisher
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto, get_zmq_socket
 
@@ -197,17 +199,24 @@ def kv_event_connect_ip(endpoint: str) -> str:
 
 
 def _open_metrics_sockets(
-    ctx: zmq.asyncio.Context,
+    ctx: zmq_asyncio.Context,
     metrics_ipc_name: str,
     fanout_endpoint: Optional[str],
     owner: bool,
-) -> tuple[zmq.asyncio.Socket, Optional[zmq.asyncio.Socket]]:
+) -> tuple[zmq_asyncio.Socket, Optional[zmq_asyncio.Socket]]:
     """The schedulers push KvMetrics to one PULL socket. Its owner (the single
     worker, or gateway child 0) re-publishes every message on ``fanout_endpoint``
     so sibling gateways can report the same usage for their own identities."""
     # SGLang's get_zmq_socket only configures PUSH/PULL/DEALER/REQ/REP/PAIR and
     # raises for PUB/SUB, so the fan-out pair is created directly.
     if owner:
+        if metrics_ipc_name.startswith("tcp://") and os.environ.get(
+            "SGLANG_ZMQ_ALLOWED_PEERS"
+        ):
+            raise ValueError(
+                "The OMQ scheduler metrics listener cannot enforce "
+                "SGLANG_ZMQ_ALLOWED_PEERS on TCP; use an IPC metrics endpoint"
+            )
         sock = get_zmq_socket(ctx, zmq.PULL, metrics_ipc_name, True)
         fanout = None
         if fanout_endpoint is not None:
@@ -267,15 +276,15 @@ class DynamoSglangPublisher:
         # Non-leader nodes don't receive scheduler metrics via this socket - they only
         # need KV event publishing which is set up separately in init_kv_event_publish()
         node_rank = getattr(self.server_args, "node_rank", 0) or 0
-        self._ctx: zmq.asyncio.Context | None = None
-        self._sock: zmq.asyncio.Socket | None = None
-        self._fanout: zmq.asyncio.Socket | None = None
+        self._ctx: zmq_asyncio.Context | None = None
+        self._sock: zmq_asyncio.Socket | None = None
+        self._fanout: zmq_asyncio.Socket | None = None
         # Engine-level gauges (total blocks, cache usage) describe one engine; only
         # the process that consumes the schedulers' metrics publishes them, so a
         # scrape across gateway children does not count the engine N times.
         self._publishes_engine_gauges = owns_engine_metrics()
         if node_rank == 0:
-            self._ctx = zmq.asyncio.Context()
+            self._ctx = zmq_asyncio.Context()
             self._sock, self._fanout = _open_metrics_sockets(
                 self._ctx,
                 scheduler_metrics_ipc_name(self.server_args, self.engine.port_args),

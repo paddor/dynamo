@@ -290,7 +290,7 @@ def run(args, results):
     env_extra = {}
     try:
         if routing:
-            import zmq
+            import pyomq as zmq
 
             alias, changed = routing_fixture()
             env_extra = {

@@ -35,7 +35,7 @@ from queue import Queue
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional, Union, cast
 
 import msgspec
-import zmq
+import pyomq as zmq
 from prometheus_client import CollectorRegistry
 
 from dynamo.common.utils.prometheus import LLMBackendMetrics
