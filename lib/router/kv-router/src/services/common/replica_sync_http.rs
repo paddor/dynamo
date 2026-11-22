@@ -146,7 +146,9 @@ mod tests {
     #[tokio::test]
     async fn manages_replica_sync_peers() {
         let cancel_token = CancellationToken::new();
-        let peer_manager = PeerManager::start(Vec::new(), cancel_token.clone(), |_| {}).unwrap();
+        let peer_manager = PeerManager::start(Vec::new(), cancel_token.clone(), |_| {})
+            .await
+            .unwrap();
         let app = router::<()>(Some(Arc::new(peer_manager)));
         let endpoint = "tcp://127.0.0.1:19092";
         let body = format!(r#"{{"endpoint":"{endpoint}"}}"#);

@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use futures::StreamExt;
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -26,7 +25,7 @@ use dynamo_runtime::component::{Component, Endpoint};
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use dynamo_runtime::transports::event_plane::EventPublisher;
 
-use crate::utils::zmq::{connect_sub_socket, multipart_message};
+use crate::utils::zmq::connect_sub_socket;
 
 const FPM_TOPIC: &str = "forward-pass-metrics";
 const FPM_VERSION: i32 = 1;
@@ -146,7 +145,6 @@ impl FpmEventRelay {
                 return;
             }
         };
-        let mut socket = socket;
         tracing::info!("FPM relay: connected to {zmq_endpoint}");
 
         loop {
@@ -156,13 +154,12 @@ impl FpmEventRelay {
                     tracing::info!("FPM relay: shutting down");
                     break;
                 }
-                result = socket.next() => {
+                result = socket.recv() => {
                     match result {
-                        Some(Ok(frames)) => {
-                            let mut frames = multipart_message(frames);
+                        Ok(frames) => {
                             // ZMQ multipart: [topic, seq, payload]
-                            if frames.len() == 3 {
-                                let payload = bytes::Bytes::from(frames.swap_remove(2));
+                            if frames.len() == 3 && let Some(payload) = frames.last_payload() {
+                                let payload = payload.into_bytes();
                                 // Before the publish, so a slow event plane does not
                                 // delay this frame's signal to the health check.
                                 progress.note_frame(&payload);
@@ -177,12 +174,8 @@ impl FpmEventRelay {
                             );
                             }
                         }
-                        Some(Err(e)) => {
+                        Err(e) => {
                             tracing::error!("FPM relay: ZMQ recv failed: {e}");
-                            break;
-                        }
-                        None => {
-                            tracing::error!("FPM relay: ZMQ stream ended");
                             break;
                         }
                     }

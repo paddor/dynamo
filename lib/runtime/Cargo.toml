@@ -44,7 +44,6 @@ async-nats = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 omq-tokio = { workspace = true }
-tmq = { workspace = true }
 lru = { version = "0.16" }
 axum = { workspace = true }
 base64 = { version = "0.22" }

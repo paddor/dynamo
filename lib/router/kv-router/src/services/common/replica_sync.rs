@@ -78,7 +78,7 @@ fn replica_sync_bind_endpoint(port: u16) -> Result<String> {
     Ok(format!("tcp://*:{port}"))
 }
 
-pub(crate) fn setup_replica_sync(
+pub(crate) async fn setup_replica_sync(
     port: Option<u16>,
     initial_peers: &[String],
     cancel_token: CancellationToken,
@@ -93,7 +93,7 @@ pub(crate) fn setup_replica_sync(
     let bind_endpoint = replica_sync_bind_endpoint(port)?;
     let process_id = generate_process_id();
     let (outbound_tx, affinity_tx, publisher_task) =
-        start_replica_publisher(&bind_endpoint, cancel_token.clone())?;
+        start_replica_publisher(&bind_endpoint, cancel_token.clone()).await?;
     Ok(Some(ReplicaSyncRuntime {
         config: ReplicaSyncConfig::new(process_id, outbound_tx, cancel_token)
             .with_affinity_publisher(affinity_tx),
@@ -101,7 +101,7 @@ pub(crate) fn setup_replica_sync(
     }))
 }
 
-fn start_replica_publisher(
+async fn start_replica_publisher(
     bind_endpoint: &str,
     cancel_token: CancellationToken,
 ) -> Result<(
@@ -110,7 +110,8 @@ fn start_replica_publisher(
     JoinHandle<()>,
 )> {
     validate_endpoint(bind_endpoint)?;
-    let mut socket = create_bound_pub_socket(bind_endpoint)
+    let (socket, _) = create_bound_pub_socket(bind_endpoint)
+        .await
         .with_context(|| format!("failed to bind replica publisher to `{bind_endpoint}`"))?;
     let (tx, mut rx) = mpsc::channel::<ScopedReplicaEvent>(REPLICA_EVENT_CHANNEL_CAPACITY);
     let (affinity_tx, mut affinity_rx) =
@@ -146,9 +147,12 @@ fn start_replica_publisher(
                     continue;
                 }
             };
-            if let Err(error) = socket.send_multipart(frames).await {
+            if let Err(error) = socket.send(omq_tokio::Message::multipart(frames)).await {
                 tracing::error!(event = %message, error = %error, "Failed to publish replica message");
             }
+        }
+        if let Err(error) = socket.close().await {
+            tracing::debug!(%error, "Replica publisher socket shutdown");
         }
     });
 
@@ -221,7 +225,7 @@ enum PeerCommand {
 
 impl PeerManager {
     #[cfg_attr(not(feature = "http"), allow(dead_code))]
-    pub(crate) fn start<F>(
+    pub(crate) async fn start<F>(
         initial_peers: Vec<String>,
         cancel_token: CancellationToken,
         handle_event: F,
@@ -235,9 +239,10 @@ impl PeerManager {
             handle_event,
             None::<fn(AffinityBindingEvent)>,
         )
+        .await
     }
 
-    pub(crate) fn start_with_affinity<F, A>(
+    pub(crate) async fn start_with_affinity<F, A>(
         initial_peers: Vec<String>,
         cancel_token: CancellationToken,
         handle_event: F,
@@ -252,14 +257,15 @@ impl PeerManager {
         } else {
             &[REPLICA_TOPIC]
         };
-        let mut socket = create_sub_socket_topics(topics)?;
+        let socket = create_sub_socket_topics(topics).await?;
         let mut configured_peers = HashSet::new();
         for endpoint in initial_peers {
             validate_endpoint(&endpoint)
                 .with_context(|| format!("invalid replica peer endpoint `{endpoint}`"))?;
             if configured_peers.insert(endpoint.clone()) {
                 socket
-                    .connect(&endpoint)
+                    .connect(endpoint.as_str())
+                    .await
                     .with_context(|| format!("failed to register replica peer `{endpoint}`"))?;
             }
         }
@@ -276,13 +282,14 @@ impl PeerManager {
                         let Some(command) = command else {
                             break;
                         };
-                        handle_peer_command(&socket, &task_peers, command);
+                        handle_peer_command(&socket, &task_peers, command).await;
                     }
-                    message = socket.recv_multipart() => {
+                    message = socket.recv() => {
                         match message {
                             Ok(frames) => handle_replica_message(&handle_event, handle_affinity.as_ref(), frames),
                             Err(error) => {
                                 tracing::error!("Failed to receive active-sequence replica event: {error}");
+                                break;
                             }
                         }
                     }
@@ -353,8 +360,8 @@ impl Drop for PeerManager {
     }
 }
 
-fn handle_peer_command(
-    socket: &crate::services::common::zmq::ZmqSocket,
+async fn handle_peer_command(
+    socket: &omq_tokio::Socket,
     peers: &RwLock<HashSet<String>>,
     command: PeerCommand,
 ) {
@@ -365,7 +372,8 @@ fn handle_peer_command(
                 return;
             }
             let result = socket
-                .connect(&endpoint)
+                .connect(endpoint.as_str())
+                .await
                 .with_context(|| format!("failed to register replica peer `{endpoint}`"))
                 .map(|()| {
                     peers.write().insert(endpoint);
@@ -379,7 +387,8 @@ fn handle_peer_command(
                 return;
             }
             let result = socket
-                .disconnect(&endpoint)
+                .disconnect(endpoint.as_str())
+                .await
                 .with_context(|| format!("failed to deregister replica peer `{endpoint}`"))
                 .map(|()| {
                     peers.write().remove(&endpoint);
@@ -393,19 +402,20 @@ fn handle_peer_command(
 fn handle_replica_message<F, A>(
     handle_event: &F,
     handle_affinity: Option<&A>,
-    frames: crate::services::common::zmq::MultipartMessage,
+    frames: omq_tokio::Message,
 ) where
     F: Fn(ScopedReplicaEvent),
     A: Fn(AffinityBindingEvent),
 {
-    let [topic, payload] = frames.as_slice() else {
+    if frames.len() != 2 {
         tracing::debug!(
             frame_count = frames.len(),
             "Dropping malformed replica message"
         );
         return;
-    };
-    match topic.as_slice() {
+    }
+    let (topic, payload) = (&frames[0], &frames[1]);
+    match topic {
         REPLICA_TOPIC => match rmp_serde::from_slice::<ScopedReplicaEvent>(payload) {
             Ok(event) => handle_event(event),
             Err(error) => {
@@ -458,13 +468,14 @@ mod tests {
         assert!(replica_sync_bind_endpoint(0).is_err());
     }
 
-    #[test]
-    fn replica_sync_requires_port_for_initial_peers() {
+    #[tokio::test]
+    async fn replica_sync_requires_port_for_initial_peers() {
         let error = setup_replica_sync(
             None,
             &["tcp://127.0.0.1:8092".to_string()],
             CancellationToken::new(),
         )
+        .await
         .unwrap_err();
 
         assert!(
@@ -477,7 +488,9 @@ mod tests {
     #[tokio::test]
     async fn publisher_runs_until_every_source_closes() {
         let (outbound, affinity, mut publisher_task) =
-            start_replica_publisher(&reserve_tcp_endpoint(), CancellationToken::new()).unwrap();
+            start_replica_publisher(&reserve_tcp_endpoint(), CancellationToken::new())
+                .await
+                .unwrap();
 
         drop(affinity);
         for _ in 0..16 {
@@ -500,11 +513,14 @@ mod tests {
         let endpoint = reserve_tcp_endpoint();
         let cancel_token = CancellationToken::new();
         let (outbound, _affinity, publisher_task) =
-            start_replica_publisher(&endpoint, cancel_token.child_token()).expect("publisher");
+            start_replica_publisher(&endpoint, cancel_token.child_token())
+                .await
+                .expect("publisher");
         let (received_tx, mut received_rx) = mpsc::channel(16);
         let manager = PeerManager::start(Vec::new(), cancel_token.child_token(), move |event| {
             let _ = received_tx.try_send(event);
         })
+        .await
         .expect("peer manager");
 
         assert!(manager.register_peer(endpoint.clone()).await.unwrap());
@@ -548,9 +564,13 @@ mod tests {
         let endpoint_b = reserve_tcp_endpoint();
         let cancel_token = CancellationToken::new();
         let (outbound_a, _affinity_a, publisher_a) =
-            start_replica_publisher(&endpoint_a, cancel_token.child_token()).unwrap();
+            start_replica_publisher(&endpoint_a, cancel_token.child_token())
+                .await
+                .unwrap();
         let (outbound_b, _affinity_b, publisher_b) =
-            start_replica_publisher(&endpoint_b, cancel_token.child_token()).unwrap();
+            start_replica_publisher(&endpoint_b, cancel_token.child_token())
+                .await
+                .unwrap();
         let registry_a = Arc::new(SlotTrackerRegistry::new_with_replica_sync(
             cancel_token.clone(),
             ReplicaSyncConfig::new(11, outbound_a, cancel_token.clone()),
@@ -564,6 +584,7 @@ mod tests {
             PeerManager::start(vec![endpoint_a], cancel_token.child_token(), move |event| {
                 dispatch_registry_b.dispatch_replica_event(event)
             })
+            .await
             .unwrap();
         let key = RoutingPartitionId::new("model", "group");
         registry_a.register(key.clone(), 1, 16, 0, 1).unwrap();

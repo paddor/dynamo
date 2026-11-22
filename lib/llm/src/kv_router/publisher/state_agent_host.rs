@@ -83,7 +83,7 @@ impl HostSockets {
         })
     }
 
-    fn for_new_slot(&mut self) -> Result<(KvStateAgentSockets, Option<usize>)> {
+    async fn for_new_slot(&mut self) -> Result<(KvStateAgentSockets, Option<usize>)> {
         let publisher_index = if self.share_publishers {
             let index = match self
                 .publishers
@@ -93,6 +93,7 @@ impl HostSockets {
                 Some(index) => index,
                 None => {
                     let socket = SharedZmqPublisherSocket::bind(KV_STATE_EVENT_TOPIC_V2)
+                        .await
                         .context("failed to bind a shared state-agent event socket")?;
                     self.publishers.push((socket, 0));
                     self.publishers.len() - 1
@@ -679,8 +680,8 @@ async fn reconcile_owner(
             kv_block_size: intent.kv_block_size,
             ingress_protocol: intent.ingress_protocol,
         };
+        let (slot_sockets, publisher_index) = sockets.for_new_slot().await?;
         slots.insert(owner, slot_shape);
-        let (slot_sockets, publisher_index) = sockets.for_new_slot()?;
         let agent = match KvStateAgent::start(KvStateAgentConfig {
             endpoint: component.endpoint(slot_endpoint_name(owner)),
             kv_state_endpoint: intent.kv_state_endpoint.clone(),
@@ -825,25 +826,25 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn failed_slot_returns_its_shared_socket_share() {
+    #[tokio::test]
+    async fn failed_slot_returns_its_shared_socket_share() {
         let mut sockets = HostSockets {
             slots_per_socket: 2,
             share_publishers: true,
             publishers: Vec::new(),
             raw_pool: None,
         };
-        sockets.for_new_slot().unwrap();
-        let (_, failed) = sockets.for_new_slot().unwrap();
+        sockets.for_new_slot().await.unwrap();
+        let (_, failed) = sockets.for_new_slot().await.unwrap();
         sockets.release(failed);
-        assert_eq!(sockets.for_new_slot().unwrap().1, failed);
+        assert_eq!(sockets.for_new_slot().await.unwrap().1, failed);
 
         assert_eq!(sockets.publishers.len(), 1);
         assert_eq!(sockets.publishers[0].1, 2);
     }
 
-    #[test]
-    fn removed_slots_reuse_their_shared_publisher() {
+    #[tokio::test]
+    async fn removed_slots_reuse_their_shared_publisher() {
         let mut sockets = HostSockets {
             slots_per_socket: 2,
             share_publishers: true,
@@ -861,7 +862,7 @@ mod tests {
                         producer_instance: None,
                         lifecycle: SlotLifecycle::Detached,
                         agent: None,
-                        publisher_index: sockets.for_new_slot().unwrap().1,
+                        publisher_index: sockets.for_new_slot().await.unwrap().1,
                         global_dp_rank: 0,
                         kv_state_endpoint: EndpointId::from("ns.backend.generate"),
                         indexer_domain_id: owner.pool().indexer_domain(),
@@ -905,7 +906,7 @@ mod tests {
                 .unwrap();
             let (mut slots, mut sockets, mut request) = agent_runtime.block_on(async {
                 let component = test_component().await;
-                let raw = SharedZmqPublisherSocket::bind("raw-kv").unwrap();
+                let raw = SharedZmqPublisherSocket::bind("raw-kv").await.unwrap();
                 let mut request = intent(
                     &instance("kv_state_agent", 1),
                     instance("producer", 11),
@@ -994,7 +995,9 @@ mod tests {
                     assert_eq!(sockets.publishers[0].1, 1);
                 }
 
-                let raw = SharedZmqPublisherSocket::bind("replacement-kv").unwrap();
+                let raw = SharedZmqPublisherSocket::bind("replacement-kv")
+                    .await
+                    .unwrap();
                 request.cache_owner_id = owner(5);
                 request.raw_zmq_endpoint = raw.endpoint().to_string();
                 reconcile_owner(

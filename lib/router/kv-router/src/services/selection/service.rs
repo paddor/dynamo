@@ -240,7 +240,8 @@ impl SelectionServiceBuilder {
             self.replica_sync_port,
             &self.replica_sync_peers,
             cancel_token.child_token(),
-        )?;
+        )
+        .await?;
         #[cfg(feature = "replica-sync-zmq")]
         if replica_runtime.is_some() {
             tracing::info!(
@@ -305,22 +306,25 @@ impl SelectionServiceBuilder {
         let peer_manager = if replica_runtime.is_some() {
             let weak_core = Arc::downgrade(&core);
             let affinity_core = Arc::downgrade(&core);
-            Some(Arc::new(PeerManager::start_with_affinity(
-                self.replica_sync_peers,
-                cancel_token.child_token(),
-                move |event| {
-                    if let Some(core) = weak_core.upgrade() {
-                        core.dispatch_replica_event(event);
-                    }
-                },
-                self.session_affinity_ttl.map(|_| {
+            Some(Arc::new(
+                PeerManager::start_with_affinity(
+                    self.replica_sync_peers,
+                    cancel_token.child_token(),
                     move |event| {
-                        if let Some(core) = affinity_core.upgrade() {
-                            core.dispatch_affinity_event(event);
+                        if let Some(core) = weak_core.upgrade() {
+                            core.dispatch_replica_event(event);
                         }
-                    }
-                }),
-            )?))
+                    },
+                    self.session_affinity_ttl.map(|_| {
+                        move |event| {
+                            if let Some(core) = affinity_core.upgrade() {
+                                core.dispatch_affinity_event(event);
+                            }
+                        }
+                    }),
+                )
+                .await?,
+            ))
         } else {
             None
         };

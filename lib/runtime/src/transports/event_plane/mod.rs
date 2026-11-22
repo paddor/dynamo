@@ -306,31 +306,23 @@ impl Stream for DeduplicatingStream {
 }
 
 /// Bind a direct-ZMQ PUB socket and return it with its advertised endpoint.
-fn bind_direct_zmq_publisher(topic: &str) -> Result<(ZmqPubTransport, String)> {
+async fn bind_direct_zmq_publisher(topic: &str, shared: bool) -> Result<(ZmqPubTransport, String)> {
     let advertised_host = event_plane_host_from_env()?;
     let bind_endpoint = if advertised_host.is_ipv4() {
         "tcp://0.0.0.0:0"
     } else {
         "tcp://[::]:0"
     };
-    let (pub_transport, actual_bind_endpoint) = std::thread::spawn({
-        let topic = topic.to_string();
-        move || -> Result<(ZmqPubTransport, String)> {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("Failed to create Tokio runtime for ZMQ")?;
-
-            rt.block_on(ZmqPubTransport::bind(bind_endpoint, &topic))
-                .with_context(|| {
-                    format!(
-                        "Failed to bind direct ZMQ publisher at {bind_endpoint} for advertised address {advertised_host}; check DYN_EVENT_PLANE_HOST and host IP support"
-                    )
-                })
-        }
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("ZMQ initialization thread panicked"))??;
+    let publisher = if shared {
+        ZmqPubTransport::bind_shared(bind_endpoint, topic).await
+    } else {
+        ZmqPubTransport::bind(bind_endpoint, topic).await
+    };
+    let (pub_transport, actual_bind_endpoint) = publisher.with_context(|| {
+            format!(
+                "Failed to bind direct ZMQ publisher at {bind_endpoint} for advertised address {advertised_host}; check DYN_EVENT_PLANE_HOST and host IP support"
+            )
+        })?;
 
     let public_endpoint = direct_zmq_public_endpoint(advertised_host, &actual_bind_endpoint)?;
     tracing::info!(%public_endpoint, "direct ZMQ publisher advertised endpoint");
@@ -350,9 +342,9 @@ pub struct SharedZmqPublisherSocket {
 }
 
 impl SharedZmqPublisherSocket {
-    pub fn bind(topic: impl Into<String>) -> Result<Self> {
+    pub async fn bind(topic: impl Into<String>) -> Result<Self> {
         let topic = topic.into();
-        let (pub_transport, endpoint) = bind_direct_zmq_publisher(&topic)?;
+        let (pub_transport, endpoint) = bind_direct_zmq_publisher(&topic, true).await?;
         Ok(Self {
             tx: Arc::new(pub_transport),
             topic,
@@ -584,7 +576,8 @@ impl EventPublisher {
                     )
                 } else {
                     // DIRECT MODE: Bind PUB socket
-                    let (pub_transport, public_endpoint) = bind_direct_zmq_publisher(&topic)?;
+                    let (pub_transport, public_endpoint) =
+                        bind_direct_zmq_publisher(&topic, false).await?;
                     let codec = Arc::new(Codec::Msgpack(MsgpackCodec));
                     TransportSetup::ZmqDirect(
                         Arc::new(pub_transport) as Arc<dyn EventTransportTx>,
@@ -1522,8 +1515,15 @@ mod tests {
                     .component("worker")
                     .expect("create component")
                     .endpoint("generate");
-                let shared = shared_socket
-                    .then(|| SharedZmqPublisherSocket::bind("events").expect("bind shared socket"));
+                let shared = if shared_socket {
+                    Some(
+                        SharedZmqPublisherSocket::bind("events")
+                            .await
+                            .expect("bind shared socket"),
+                    )
+                } else {
+                    None
+                };
                 let publisher_a = endpoint_publisher(&endpoint, shared.as_ref()).await;
                 let publisher_b = endpoint_publisher(&endpoint, shared.as_ref()).await;
                 let mut subscriber = EventSubscriber::for_endpoint_with_transport(

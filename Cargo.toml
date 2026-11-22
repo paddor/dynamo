@@ -191,9 +191,7 @@ strum = { version = "0.27", features = ["derive"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tempfile = "3"
 thiserror = { version = "2.0.17" }
-omq-tokio = { version = "0.37.1" }
-tmq = { version = "0.5.0" }
-zmq = { version = "0.10" }
+omq-tokio = { version = "0.39.2" }
 tokio = { version = "=1.54.1", features = ["full"] }
 tokio-stream = { version = "0.1" }
 tokio-util = { version = "0.7.19", features = ["codec", "net", "rt", "io-util"] }

@@ -4,33 +4,18 @@
 //! ZMQ KV event publishing in the vLLM native wire format.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
 use dynamo_kv_events::event::{KvCacheEvent, KvCacheEventData};
 use dynamo_kv_events::residency::StorageTier;
-use futures::{Sink, SinkExt, StreamExt};
+use omq_tokio::{Context, ContextConfig, Message, Options, Payload, Socket, SocketType};
 use serde::Serialize;
-use tmq::{
-    AsZmqSocket, Context, Multipart, SocketBuilder,
-    publish::{Publish, publish},
-    router::{Router, router},
-};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 use crate::common::protocols::{RawKvEvent, RawKvEventSink};
-
-type MultipartMessage = Vec<Vec<u8>>;
-type SharedPubSocket = Arc<Mutex<Publish>>;
-
-const ZMQ_SNDTIMEOUT_MS: i32 = 0;
-const ZMQ_RCVTIMEOUT_MS: i32 = 100;
-const ZMQ_RECONNECT_IVL_MS: i32 = 100;
-const ZMQ_RECONNECT_IVL_MAX_MS: i32 = 5000;
-const ZMQ_TCP_KEEPALIVE: i32 = 1;
-const ZMQ_LINGER_MS: i32 = 0;
 
 /// Maximum number of entries in the replay ring buffer.
 const REPLAY_BUFFER_CAPACITY: usize = 10_000;
@@ -85,36 +70,17 @@ impl ZmqKvEventSink {
             .context("ZmqKvEventSink::bind requires an active Tokio runtime")?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<RawKvEvent>>();
 
-        // Reserve the explicit replay port before choosing an automatic PUB port.
-        let (mut router_socket, replay_endpoint) = if let Some(rp) = replay_port {
-            let replay_ep = format!("tcp://0.0.0.0:{rp}");
-            let sock = bind_router_socket(&replay_ep)
-                .map_err(|e| anyhow::anyhow!("ZMQ ROUTER bind to {replay_ep} failed: {e}"))?;
-            let replay_ep = sock
-                .get_socket()
-                .get_last_endpoint()?
-                .map_err(|_| anyhow::anyhow!("ZMQ replay endpoint is not UTF-8"))?;
-            tracing::info!(
-                "ZmqKvEventSink replay ROUTER bound to {replay_ep} for dp_rank {dp_rank}"
-            );
-            (Some(sock), Some(replay_ep))
-        } else {
-            (None, None)
-        };
-
-        let endpoint = format!(
-            "tcp://0.0.0.0:{}",
-            port.map_or("*".to_string(), |p| p.to_string())
-        );
-        let pub_socket = bind_pub_socket(&endpoint)
-            .map_err(|e| anyhow::anyhow!("ZMQ PUB bind to {endpoint} failed: {e}"))?;
-        let endpoint = pub_socket
-            .get_socket()
-            .get_last_endpoint()?
-            .map_err(|_| anyhow::anyhow!("ZMQ PUB endpoint is not UTF-8"))?;
+        let (pub_socket, endpoint, replay) = bind_publishers(port, replay_port)?;
         tracing::info!("ZmqKvEventSink bound to {endpoint} for dp_rank {dp_rank}");
-
-        let pub_socket: SharedPubSocket = Arc::new(Mutex::new(pub_socket));
+        let (mut router_socket, replay_endpoint) = match replay {
+            Some((socket, endpoint)) => {
+                tracing::info!(
+                    "ZmqKvEventSink replay ROUTER bound to {endpoint} for dp_rank {dp_rank}"
+                );
+                (Some(socket), Some(endpoint))
+            }
+            None => (None, None),
+        };
         runtime.spawn(async move {
             let mut seq_num: u64 = 0;
             let mut ring_buffer: VecDeque<(u64, Bytes)> = VecDeque::new();
@@ -124,20 +90,15 @@ impl ZmqKvEventSink {
                     biased;
 
                     replay_result = async {
-                        match router_socket.as_mut() {
-                            Some(socket) => socket.next().await,
+                        match router_socket.as_ref() {
+                            Some(socket) => socket.recv().await,
                             None => std::future::pending().await,
                         }
                     } => {
                         let req_msg = match replay_result {
-                            Some(Ok(req_msg)) => multipart_message(req_msg),
-                            Some(Err(error)) => {
+                            Ok(req_msg) => req_msg,
+                            Err(error) => {
                                 tracing::warn!("Replay ROUTER recv error: {error}");
-                                router_socket = None;
-                                continue;
-                            }
-                            None => {
-                                tracing::warn!("Replay ROUTER stream ended");
                                 router_socket = None;
                                 continue;
                             }
@@ -147,8 +108,8 @@ impl ZmqKvEventSink {
                             continue;
                         }
 
-                        let identity = Bytes::copy_from_slice(req_msg.first().unwrap());
-                        let start_seq_bytes = req_msg.get(2).unwrap();
+                        let identity = &req_msg[0];
+                        let start_seq_bytes = &req_msg[2];
                         if start_seq_bytes.len() != 8 {
                             tracing::warn!("Invalid replay start_seq length: {}", start_seq_bytes.len());
                             continue;
@@ -187,31 +148,15 @@ impl ZmqKvEventSink {
                             .unwrap_or(0)
                             .min(ring_buffer.len());
 
-                        let sock = router_socket.as_mut().unwrap();
-                        for (seq, payload) in ring_buffer.iter().skip(start_idx) {
-                            // ROUTER consumes the identity frame; the DEALER-side
-                            // listener receives [delimiter, topic, seq, payload].
-                            let frames = vec![
-                                identity.clone().to_vec(),
-                                Vec::new(),
-                                Vec::new(),
-                                seq.to_be_bytes().to_vec(),
-                                payload.to_vec(),
-                            ];
-                            if let Err(e) = send_multipart_direct(sock, frames).await {
-                                tracing::warn!("Replay send error: {e}");
-                                break;
+                        if let Some(socket) = router_socket.as_ref() {
+                            for (seq, payload) in ring_buffer.iter().skip(start_idx) {
+                                if let Err(error) = send_replay(socket, identity, seq.to_be_bytes(), payload.clone()).await {
+                                    tracing::warn!("Replay send error: {error}");
+                                    break;
+                                }
                             }
+                            let _ = send_replay(socket, identity, (-1i64).to_be_bytes(), Bytes::new()).await;
                         }
-
-                        let sentinel_frames = vec![
-                            identity.to_vec(),
-                            Vec::new(),
-                            Vec::new(),
-                            (-1i64).to_be_bytes().to_vec(),
-                            Vec::new(),
-                        ];
-                        let _ = send_multipart_direct(sock, sentinel_frames).await;
                     }
 
                     msg_opt = rx.recv() => {
@@ -233,12 +178,12 @@ impl ZmqKvEventSink {
                             ring_buffer.push_back((seq_num, payload.clone()));
                         }
 
-                        let frames = vec![
-                            Vec::new(),
-                            seq_num.to_be_bytes().to_vec(),
-                            payload.to_vec(),
-                        ];
-                        if let Err(e) = send_multipart(&pub_socket, frames).await {
+                        let message = Message::multipart_payloads([
+                            Payload::new(),
+                            Payload::from_slice(&seq_num.to_be_bytes()),
+                            Payload::from(payload),
+                        ]);
+                        if let Err(e) = pub_socket.send(message).await {
                             tracing::warn!("Failed to send ZMQ KV event: {e}");
                         }
 
@@ -360,67 +305,64 @@ fn convert_to_zmq_events(
     }
 }
 
-fn configure_common_builder<T>(builder: SocketBuilder<T>) -> SocketBuilder<T>
-where
-    T: tmq::FromZmqSocket<T>,
-{
-    builder
-        .set_linger(ZMQ_LINGER_MS)
-        .set_reconnect_ivl(ZMQ_RECONNECT_IVL_MS)
-        .set_reconnect_ivl_max(ZMQ_RECONNECT_IVL_MAX_MS)
-        .set_tcp_keepalive(ZMQ_TCP_KEEPALIVE)
+type BoundSocket = (Socket, String);
+
+fn bind_publishers(
+    port: Option<u16>,
+    replay_port: Option<u16>,
+) -> Result<(Socket, String, Option<BoundSocket>)> {
+    // The server constructors bind synchronously. Run these startup operations
+    // on the socket context's own runtime and share that context across ranks.
+    static CONTEXT: OnceLock<Context> = OnceLock::new();
+    let context = CONTEXT.get_or_init(|| {
+        Context::with_config_and_name(ContextConfig { io_threads: 1 }, "mocker-omq")
+    });
+    let publisher = context.socket(SocketType::Pub, Options::default().linger(Duration::ZERO));
+    let replay = replay_port.map(|port| {
+        (
+            context.socket(
+                SocketType::Router,
+                Options::default().linger(Duration::ZERO),
+            ),
+            port,
+        )
+    });
+    context.block_on(async move {
+        // Reserve an explicit replay port before selecting the publisher port.
+        let replay = if let Some((socket, port)) = replay {
+            let endpoint = format!("tcp://0.0.0.0:{port}");
+            let bound = socket
+                .bind(endpoint.as_str())
+                .await
+                .with_context(|| format!("ZMQ ROUTER bind to {endpoint} failed"))?;
+            Some((socket, bound.to_string()))
+        } else {
+            None
+        };
+        let endpoint = format!("tcp://0.0.0.0:{}", port.unwrap_or(0));
+        let bound = publisher
+            .bind(endpoint.as_str())
+            .await
+            .with_context(|| format!("ZMQ PUB bind to {endpoint} failed"))?;
+        Ok((publisher, bound.to_string(), replay))
+    })
 }
 
-fn configure_receive_builder<T>(builder: SocketBuilder<T>) -> SocketBuilder<T>
-where
-    T: tmq::FromZmqSocket<T>,
-{
-    configure_common_builder(builder).set_rcvtimeo(ZMQ_RCVTIMEOUT_MS)
-}
-
-fn configure_send_builder<T>(builder: SocketBuilder<T>) -> SocketBuilder<T>
-where
-    T: tmq::FromZmqSocket<T>,
-{
-    configure_common_builder(builder).set_sndtimeo(ZMQ_SNDTIMEOUT_MS)
-}
-
-fn configure_bidirectional_builder<T>(builder: SocketBuilder<T>) -> SocketBuilder<T>
-where
-    T: tmq::FromZmqSocket<T>,
-{
-    configure_receive_builder(builder).set_sndtimeo(ZMQ_SNDTIMEOUT_MS)
-}
-
-fn bind_pub_socket(endpoint: &str) -> Result<Publish> {
-    let ctx = Context::new();
-    let socket = configure_send_builder(publish(&ctx)).bind(endpoint)?;
-    Ok(socket)
-}
-
-fn bind_router_socket(endpoint: &str) -> Result<Router> {
-    let ctx = Context::new();
-    let socket = configure_bidirectional_builder(router(&ctx)).bind(endpoint)?;
-    Ok(socket)
-}
-
-fn multipart_message(multipart: Multipart) -> MultipartMessage {
-    multipart.into_iter().map(|frame| frame.to_vec()).collect()
-}
-
-async fn send_multipart<S>(socket: &Arc<Mutex<S>>, frames: MultipartMessage) -> Result<()>
-where
-    S: Sink<Multipart, Error = tmq::TmqError> + Unpin,
-{
-    socket.lock().await.send(Multipart::from(frames)).await?;
-    Ok(())
-}
-
-async fn send_multipart_direct<S>(socket: &mut S, frames: MultipartMessage) -> Result<()>
-where
-    S: Sink<Multipart, Error = tmq::TmqError> + Unpin,
-{
-    socket.send(Multipart::from(frames)).await?;
+async fn send_replay(
+    socket: &Socket,
+    identity: &[u8],
+    sequence: [u8; 8],
+    payload: Bytes,
+) -> Result<()> {
+    // ROUTER consumes the route identity. DEALER receives delimiter, topic,
+    // sequence, and payload.
+    let message = Message::multipart_payloads([
+        Payload::new(),
+        Payload::new(),
+        Payload::from_slice(&sequence),
+        Payload::from(payload),
+    ]);
+    socket.send_to(identity, message).await?;
     Ok(())
 }
 
@@ -493,7 +435,6 @@ mod tests {
     #[tokio::test]
     async fn automatic_replay_port_serves_events_and_rejects_a_second_bind() {
         use std::time::Duration;
-        use tmq::dealer::dealer;
 
         let sink = ZmqKvEventSink::bind(None, Some(0), 0, 4).unwrap();
         let replay_endpoint = sink.replay_endpoint().unwrap();
@@ -507,21 +448,19 @@ mod tests {
             session_id: Some("wire-session".into()),
         })
         .unwrap();
-        let ctx = Context::new();
-        let mut replay = dealer(&ctx)
-            .set_linger(0)
-            .connect(&replay_endpoint.replace("0.0.0.0", "127.0.0.1"))
-            .unwrap();
+        let replay = Socket::new(SocketType::Dealer, Options::default());
+        let endpoint = replay_endpoint.replace("0.0.0.0", "127.0.0.1");
+        replay.connect(endpoint.as_str()).await.unwrap();
         let frames = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 replay
-                    .send(Multipart::from(vec![
+                    .send(Message::multipart([
                         Vec::new(),
                         0u64.to_be_bytes().to_vec(),
                     ]))
                     .await
                     .unwrap();
-                let frames = multipart_message(replay.next().await.unwrap().unwrap());
+                let frames = replay.recv().await.unwrap();
                 assert_eq!(frames.len(), 4);
                 if frames[2] != (-1i64).to_be_bytes() {
                     break frames;

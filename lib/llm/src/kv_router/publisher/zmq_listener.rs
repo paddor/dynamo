@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use futures::StreamExt;
+use bytes::Bytes;
+use omq_tokio::Message;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -19,7 +20,7 @@ use dynamo_router_protocol::worker::{WorkerId, WorkerWithDpRank};
 
 use super::{PublisherInput, ZmqRecoveryConfig};
 use crate::kv_router::metrics::kv_publisher_metrics;
-use crate::utils::zmq::{connect_sub_socket, multipart_message};
+use crate::utils::zmq::connect_sub_socket;
 
 pub(super) struct DecodedZmqKvBatch {
     pub(super) source_cursor: u64,
@@ -29,9 +30,7 @@ pub(super) struct DecodedZmqKvBatch {
 /// Decode the transport envelope shared by legacy and residency-aware inputs.
 ///
 /// Callers retain their own malformed-input and protocol-version policies.
-pub(super) fn decode_zmq_kv_batch(
-    frames: crate::utils::zmq::MultipartMessage,
-) -> Result<DecodedZmqKvBatch> {
+pub(super) fn decode_zmq_kv_batch(frames: Message) -> Result<DecodedZmqKvBatch> {
     let (source_cursor, payload) = split_zmq_kv_batch(frames)?;
     let batch = decode_event_batch(&payload).context("failed to decode KV event batch")?;
     Ok(DecodedZmqKvBatch {
@@ -41,21 +40,21 @@ pub(super) fn decode_zmq_kv_batch(
 }
 
 /// Split the envelope into its sequence and still-encoded payload.
-pub(super) fn split_zmq_kv_batch(
-    mut frames: crate::utils::zmq::MultipartMessage,
-) -> Result<(u64, Vec<u8>)> {
-    if frames.len() != 3 {
-        anyhow::bail!("expected three ZMQ frames, received {}", frames.len());
-    }
-    let payload = frames.pop().expect("frame count was validated");
-    let sequence = frames.pop().expect("frame count was validated");
-    let sequence: [u8; 8] = sequence.try_into().map_err(|sequence: Vec<u8>| {
+pub(super) fn split_zmq_kv_batch(frames: Message) -> Result<(u64, Bytes)> {
+    anyhow::ensure!(
+        frames.len() == 3,
+        "expected three ZMQ frames, received {}",
+        frames.len()
+    );
+    let sequence = &frames[1];
+    let sequence: [u8; 8] = sequence.try_into().map_err(|_| {
         anyhow::anyhow!(
             "ZMQ sequence must contain eight bytes, received {}",
             sequence.len()
         )
     })?;
-    Ok((u64::from_be_bytes(sequence), payload))
+    let payload = frames.last_payload().context("missing KV payload frame")?;
+    Ok((u64::from_be_bytes(sequence), payload.into_bytes()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -109,7 +108,6 @@ pub(super) async fn start_zmq_listener(
             return;
         }
     };
-    let mut socket = socket;
 
     if cancellation_token.is_cancelled() {
         return;
@@ -151,14 +149,13 @@ pub(super) async fn start_zmq_listener(
                 tracing::warn!(%zmq_endpoint, rank, "KV event source heartbeat expired; cleared residency");
             }
 
-            msg_result = socket.next() => {
+            msg_result = socket.recv() => {
                 let frames = match msg_result {
-                    Some(Ok(frames)) => multipart_message(frames),
-                    Some(Err(error)) => {
+                    Ok(frames) => frames,
+                    Err(error) => {
                         tracing::error!(endpoint = %zmq_endpoint, error = %error, "ZMQ listener recv failed");
                         break 'main format!("ZMQ recv failed: {error}");
                     }
-                    None => break 'main String::from("ZMQ stream ended"),
                 };
                 let DecodedZmqKvBatch {
                     source_cursor: engine_seq,

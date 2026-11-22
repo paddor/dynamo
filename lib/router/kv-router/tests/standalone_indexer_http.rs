@@ -538,15 +538,6 @@ async fn duplicate_store_warning_is_exported() {
 
 /// Reserve an OS-assigned TCP port by binding+dropping a `std::net::TcpListener`
 /// (matches the pattern used in `services/indexer/listener.rs` tests).
-fn reserve_zmq_endpoint() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
-    let port = listener
-        .local_addr()
-        .expect("local_addr on probe listener")
-        .port();
-    drop(listener);
-    format!("tcp://127.0.0.1:{port}")
-}
 
 /// Build a `RawKvEvent::BlockStored` with the minimum fields the engine
 /// emits over ZMQ. `medium` is the wire spelling of the storage tier:
@@ -585,13 +576,15 @@ fn encode_batch(event: RawKvEvent, dp_rank: i32) -> Vec<u8> {
 
 /// Send one ZMQ multipart message in the listener's expected frame layout:
 /// `[topic, seq_be_bytes, payload]`. Topic is unused (SUB filter is `b""`).
-fn send_live_message(pub_socket: &zmq::Socket, seq: u64, payload: &[u8]) {
+async fn send_live_message(pub_socket: &omq_tokio::Socket, seq: u64, payload: Vec<u8>) {
     pub_socket
-        .send_multipart(
-            [b"" as &[u8], &seq.to_be_bytes(), payload],
-            0, // no flags
-        )
-        .expect("send_multipart");
+        .send(omq_tokio::Message::multipart([
+            Vec::new(),
+            seq.to_be_bytes().to_vec(),
+            payload,
+        ]))
+        .await
+        .expect("send multipart");
 }
 
 /// Poll `/query` against `(model, routing group)` until `instances[instance_id].cpu`
@@ -666,15 +659,15 @@ async fn zmq_published_tiered_events_appear_in_http_query() {
     let (base_url, server_cancel, server_task) = spawn_indexer_http(state).await;
     let client = reqwest::Client::new();
 
-    // Bind a PUB socket BEFORE /register so the listener finds someone to
-    // subscribe to once it spawns. ZMQ's slow-joiner problem still means a
-    // few early messages may be lost; we send a probe before the real
-    // payloads to flush the connection.
-    let zmq_endpoint = reserve_zmq_endpoint();
-    let zmq_ctx = zmq::Context::new();
-    let pub_socket = zmq_ctx.socket(zmq::PUB).expect("create PUB socket");
-    pub_socket.set_linger(0).expect("set_linger");
-    pub_socket.bind(&zmq_endpoint).expect("bind PUB socket");
+    // Bind a PUB socket and wait for the worker subscription before publishing.
+    let pub_socket =
+        omq_tokio::Socket::new(omq_tokio::SocketType::Pub, omq_tokio::Options::default());
+    let mut monitor = pub_socket.monitor();
+    let zmq_endpoint = pub_socket
+        .bind("tcp://127.0.0.1:0")
+        .await
+        .expect("bind PUB socket")
+        .to_string();
 
     // Register the worker — this triggers the listener to connect a SUB.
     let resp = client
@@ -692,9 +685,16 @@ async fn zmq_published_tiered_events_appear_in_http_query() {
         .expect("POST /register");
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
 
-    // Give the SUB time to connect to our PUB. ZMQ buffers most things, but
-    // empirically a short settle plus a probe message reduces flake.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let omq_tokio::MonitorEvent::SubscribeReceived { .. } = monitor.recv().await.unwrap()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("subscriber registered its filter");
 
     // Token sequences for two adjacent blocks. block_size = 4.
     let device_tokens = vec![10_u32, 11, 12, 13];
@@ -710,7 +710,7 @@ async fn zmq_published_tiered_events_appear_in_http_query() {
         BLOCK_SIZE as usize,
         "GPU",
     );
-    send_live_message(&pub_socket, 0, &encode_batch(device_event, 0));
+    send_live_message(&pub_socket, 0, encode_batch(device_event, 0)).await;
 
     // seq 1: HostPinned-tier store anchored on the device hash.
     let host_event = raw_block_stored(
@@ -720,7 +720,7 @@ async fn zmq_published_tiered_events_appear_in_http_query() {
         BLOCK_SIZE as usize,
         "CPU_TIER1",
     );
-    send_live_message(&pub_socket, 1, &encode_batch(host_event, 0));
+    send_live_message(&pub_socket, 1, encode_batch(host_event, 0)).await;
 
     // Compose the full prefix for the query: device tokens followed by host
     // tokens. The server will hash this and match it against the radix tree

@@ -23,7 +23,7 @@ profile = []
 # feature: a caller opts in per replay with ReplayDeterminism::CanonicalV1.
 replay-bench = ["aisim-core/replay-bench", "dynamo-kv-router/bench", "dynamo-kv-indexer/bench", "dynamo-scheduler/bench"]
 test-support = []
-zmq-events = ["dep:tmq"]
+zmq-events = ["dep:omq-tokio"]
 
 [dependencies]
 dynamo-router-policies = { workspace = true }
@@ -53,7 +53,7 @@ rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
-tmq = { workspace = true, optional = true }
+omq-tokio = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
@@ -79,5 +79,4 @@ tokio-timerfd = "0.2"
 dynamo-kv-router = { workspace = true, features = ["metrics"] }
 rstest = "0.18.2"
 tempfile = { workspace = true }
-tmq = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

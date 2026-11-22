@@ -20,16 +20,13 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    discovery::RuntimeConfigWatch,
-    kv_router::metrics::RoutingOverheadMetrics,
-    local_model::runtime_config::ModelRuntimeConfig,
-    utils::zmq::{connect_sub_socket, multipart_message},
+    discovery::RuntimeConfigWatch, kv_router::metrics::RoutingOverheadMetrics,
+    local_model::runtime_config::ModelRuntimeConfig, utils::zmq::connect_sub_socket,
 };
 use dynamo_kv_events::residency::StorageTier;
 use dynamo_kv_hashing::ExternalSequenceBlockHash;
@@ -623,7 +620,7 @@ impl HicacheSharedKvCache {
             let mut tenant: Arc<str> = config.tenant_id().into();
             let mut layout = config.key_layout();
             self.clear();
-            let mut socket = match connect_sub_socket(&endpoint, None).await {
+            let socket = match connect_sub_socket(&endpoint, None).await {
                 Ok(socket) => socket,
                 Err(error) => {
                     self.record_subscriber_error();
@@ -656,17 +653,12 @@ impl HicacheSharedKvCache {
                             break;
                         }
                     }
-                    message = socket.next() => {
+                    message = socket.recv() => {
                         let frames = match message {
-                            Some(Ok(frames)) => multipart_message(frames),
-                            Some(Err(error)) => {
+                            Ok(frames) => frames,
+                            Err(error) => {
                                 self.record_subscriber_error();
                                 tracing::warn!(%endpoint, %error, "Mooncake KV event stream failed; reconnecting");
-                                break;
-                            }
-                            None => {
-                                self.record_subscriber_error();
-                                tracing::warn!(%endpoint, "Mooncake KV event stream ended; reconnecting");
                                 break;
                             }
                         };
@@ -692,14 +684,17 @@ impl HicacheSharedKvCache {
 }
 
 fn parse_mooncake_event_frames(
-    frames: &[Vec<u8>],
+    frames: &omq_tokio::Message,
 ) -> anyhow::Result<(u64, Vec<MooncakeObjectEvent>)> {
-    let [_, sequence, payload] = frames else {
-        anyhow::bail!("expected three frames, got {}", frames.len());
-    };
+    anyhow::ensure!(
+        frames.len() == 3,
+        "expected three frames, got {}",
+        frames.len()
+    );
+    let sequence = &frames[1];
+    let payload = &frames[2];
     let sequence = u64::from_be_bytes(
         sequence
-            .as_slice()
             .try_into()
             .map_err(|_| anyhow::anyhow!("expected an 8-byte sequence frame"))?,
     );
@@ -1380,9 +1375,12 @@ mod tests {
         ))
         .unwrap();
 
-        let (sequence, events) =
-            parse_mooncake_event_frames(&[Vec::new(), 7_u64.to_be_bytes().to_vec(), payload])
-                .unwrap();
+        let (sequence, events) = parse_mooncake_event_frames(&omq_tokio::Message::multipart([
+            Vec::new(),
+            7_u64.to_be_bytes().to_vec(),
+            payload,
+        ]))
+        .unwrap();
 
         assert_eq!(sequence, 7);
         assert_eq!(events[0].object_key.as_deref(), Some("key-0"));
@@ -1965,16 +1963,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscriber_updates_tenant_and_clears_unavailable_config() {
         use crate::utils::zmq::{bind_pub_socket, send_multipart};
-        use tmq::AsZmqSocket;
-
-        let publisher = bind_pub_socket("tcp://127.0.0.1:*").await.unwrap();
-        let endpoint = publisher
-            .lock()
-            .await
-            .get_socket()
-            .get_last_endpoint()
-            .unwrap()
-            .unwrap();
+        let (publisher, endpoint) = bind_pub_socket("tcp://127.0.0.1:*").await.unwrap();
         let config = SglangHicacheMooncakeConfig {
             kv_events_endpoint: Some(endpoint),
             ..mooncake_config()

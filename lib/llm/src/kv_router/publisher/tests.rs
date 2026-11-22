@@ -1384,7 +1384,7 @@ mod tests_startup_helpers {
         let topic = "".to_string(); // subscribe to all
 
         // Publisher side - set up first
-        let pub_socket = bind_pub_socket(&endpoint).await.unwrap();
+        let (pub_socket, _) = bind_pub_socket(&endpoint).await.unwrap();
 
         // Cancellation token so we can stop the listener
         let token = dynamo_runtime::CancellationToken::new();
@@ -1590,7 +1590,7 @@ mod tests_startup_helpers {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<PublisherInput>();
         let (_ipc_dir, endpoint) = unique_ipc_endpoint();
-        let pub_socket = bind_pub_socket(&endpoint).await.unwrap();
+        let (pub_socket, _) = bind_pub_socket(&endpoint).await.unwrap();
         let token = dynamo_runtime::CancellationToken::new();
         let listener_handle = tokio::spawn({
             let token = token.clone();
@@ -1693,7 +1693,7 @@ mod tests_startup_helpers {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<PublisherInput>();
         let (_ipc_dir, endpoint) = unique_ipc_endpoint();
-        let pub_socket = bind_pub_socket(&endpoint).await.unwrap();
+        let (pub_socket, _) = bind_pub_socket(&endpoint).await.unwrap();
         let token = dynamo_runtime::CancellationToken::new();
         let listener_handle = tokio::spawn({
             let token = token.clone();
@@ -1811,7 +1811,7 @@ mod tests_startup_helpers {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-        let pub_socket = bind_pub_socket(&endpoint).await.unwrap();
+        let (pub_socket, _) = bind_pub_socket(&endpoint).await.unwrap();
         let batch = KvEventBatch {
             ts: 0.0,
             events: vec![RawKvEvent::BlockStored {

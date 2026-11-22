@@ -5,37 +5,41 @@
 
 use super::PublisherInput;
 use super::zmq_listener::{is_mismatched_rank, normalize_batch, split_zmq_kv_batch};
-use crate::utils::zmq::multipart_message;
+use bytes::Bytes;
 #[cfg(test)]
 use dynamo_kv_events::placement::PlacementEvent;
 use dynamo_kv_events::zmq_wire::{ZmqEventNormalizer, decode_event_batch};
 use dynamo_router_protocol::worker::WorkerWithDpRank;
-use dynamo_runtime::transports::zmq::ipv6_option_for;
-use futures::{FutureExt, SinkExt, StreamExt};
+use dynamo_runtime::transports::zmq::{connect_socket, new_socket};
+use omq_tokio::{Error as OmqError, Message, MonitorEvent, MonitorStream, SocketType};
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 
 #[derive(Debug, PartialEq, Eq)]
 enum ReplayFrame {
-    Batch(u64, Vec<u8>),
+    Batch(u64, Bytes),
     End,
 }
 
-fn decode_replay(frames: Vec<Vec<u8>>) -> Result<ReplayFrame> {
+fn decode_replay(frames: Message) -> Result<ReplayFrame> {
     // DEALER removes the identity, leaving delimiter, topic, sequence and payload.
-    let Ok([delimiter, _, sequence, payload]) = <[Vec<u8>; 4]>::try_from(frames) else {
-        bail!("invalid KV replay envelope");
-    };
-    anyhow::ensure!(delimiter.is_empty(), "invalid KV replay envelope");
-    let sequence: [u8; 8] = sequence.as_slice().try_into()?;
+    anyhow::ensure!(
+        frames.len() == 4 && frames[0].is_empty(),
+        "invalid KV replay envelope"
+    );
+    let sequence: [u8; 8] = (&frames[2]).try_into()?;
+    let payload = frames.last_payload().context("missing KV replay payload")?;
     match (sequence == (-1_i64).to_be_bytes(), payload.is_empty()) {
         (true, true) => Ok(ReplayFrame::End),
-        (false, false) => Ok(ReplayFrame::Batch(u64::from_be_bytes(sequence), payload)),
+        (false, false) => Ok(ReplayFrame::Batch(
+            u64::from_be_bytes(sequence),
+            payload.into_bytes(),
+        )),
         _ => bail!("invalid KV replay end marker"),
     }
 }
@@ -44,7 +48,7 @@ fn decode_replay(frames: Vec<Vec<u8>>) -> Result<ReplayFrame> {
 #[derive(Debug)]
 struct ReplayCursor {
     next: u64,
-    pending: BTreeMap<u64, Vec<u8>>,
+    pending: BTreeMap<u64, Bytes>,
     bytes: usize,
     limit: usize,
 }
@@ -61,7 +65,7 @@ impl ReplayCursor {
     fn next(&self) -> u64 {
         self.next
     }
-    fn insert(&mut self, sequence: u64, payload: Vec<u8>) -> Result<()> {
+    fn insert(&mut self, sequence: u64, payload: Bytes) -> Result<()> {
         if sequence < self.next {
             // Live overlap with replay, or every batch of an engine restarted at the same address.
             tracing::debug!(
@@ -159,30 +163,34 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const ROUND_TIMEOUT: Duration = Duration::from_secs(120);
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn wait_for_handshake(monitor: &mut tmq::pair::Pair) -> Result<()> {
-    let event = monitor
-        .next()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("KV socket monitor ended"))??;
-    let data = event
-        .iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("empty monitor event"))?;
-    let kind = u16::from_ne_bytes(
-        data.get(..2)
-            .ok_or_else(|| anyhow::anyhow!("short monitor event"))?
-            .try_into()?,
-    );
-    anyhow::ensure!(
-        kind == zmq::SocketEvent::HANDSHAKE_SUCCEEDED as u16,
-        "KV socket disconnected during recovery"
-    );
-    Ok(())
+async fn wait_for_handshake(monitor: &mut MonitorStream) -> Result<()> {
+    loop {
+        match monitor.recv().await? {
+            MonitorEvent::HandshakeSucceeded { .. } => return Ok(()),
+            MonitorEvent::ConnectStopped { .. } | MonitorEvent::Closed => {
+                bail!("KV socket closed before completing a handshake")
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn wait_for_disconnect(monitor: &mut MonitorStream) {
+    while let Ok(event) = monitor.recv().await {
+        if matches!(
+            event,
+            MonitorEvent::Disconnected { .. }
+                | MonitorEvent::ConnectStopped { .. }
+                | MonitorEvent::Closed
+        ) {
+            return;
+        }
+    }
 }
 
 /// Like ordinary live ingestion, an unreadable message is skipped; a later gap repairs it.
-fn live_batch(message: tmq::Multipart) -> Option<(u64, Vec<u8>)> {
-    split_zmq_kv_batch(multipart_message(message))
+fn live_batch(message: Message) -> Option<(u64, Bytes)> {
+    split_zmq_kv_batch(message)
         .inspect_err(|error| tracing::warn!(%error, "Failed to decode ZMQ KV batch envelope"))
         .ok()
 }
@@ -258,7 +266,7 @@ impl<'a> RecoveryIngest<'a> {
     }
 
     /// Handles bad events as ordinary live ingestion does.
-    fn apply(&mut self, sequence: u64, payload: Vec<u8>) -> Result<(), RecoveryError> {
+    fn apply(&mut self, sequence: u64, payload: Bytes) -> Result<(), RecoveryError> {
         self.cursor.insert(sequence, payload).map_err(retry)?;
         while let Some(payload) = self.cursor.pending.remove(&self.cursor.next) {
             self.cursor.bytes -= payload.len();
@@ -397,28 +405,20 @@ async fn recovery_session(
     let connect = async {
         let (live, mut live_monitor) =
             crate::utils::zmq::connect_sub_socket_with_monitor(endpoint, topic).await?;
-        let ctx = tmq::Context::new();
-        // Attach the monitor reader before connecting so the handshake event cannot be missed.
-        let mut replay_monitor = tmq::pair(&ctx).connect("inproc://replay-monitor")?;
-        // Drain replies eagerly: vLLM's ROUTER drops batches once a peer's queue is full.
-        let replay = tmq::dealer(&ctx)
-            .set_linger(0)
-            .set_ipv6(ipv6_option_for(&config.replay_endpoint)?)
-            .set_rcvhwm(0)
-            .set_maxmsgsize(MAX_REPLAY_BYTES as i64)
-            .monitor(
-                "inproc://replay-monitor",
-                zmq::SocketEvent::HANDSHAKE_SUCCEEDED as i32
-                    | zmq::SocketEvent::DISCONNECTED as i32,
-            )
-            .connect(&config.replay_endpoint)?;
+        // Drain replies eagerly: vLLM's ROUTER drops batches once its peer queue is full.
+        let options = crate::utils::zmq::socket_options()
+            .recv_hwm(100_000)
+            .max_message_size(MAX_REPLAY_BYTES);
+        let replay = new_socket(SocketType::Dealer, options)?;
+        let mut replay_monitor = replay.monitor();
+        connect_socket(&replay, &config.replay_endpoint).await?;
         tokio::try_join!(
             wait_for_handshake(&mut live_monitor),
             wait_for_handshake(&mut replay_monitor)
         )?;
         Ok::<_, anyhow::Error>((live, live_monitor, replay, replay_monitor))
     };
-    let (mut live, mut live_monitor, mut replay, mut replay_monitor) = tokio::select! {
+    let (live, mut live_monitor, replay, mut replay_monitor) = tokio::select! {
         biased;
         _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => return Err(retry(anyhow::anyhow!("KV recovery deadline exceeded while connecting"))),
         result = tokio::time::timeout(INACTIVITY_TIMEOUT, connect) => result.map_err(retry)?.map_err(retry)?,
@@ -434,12 +434,12 @@ async fn recovery_session(
     loop {
         tokio::select! {
             biased;
-            _ = live_monitor.next() => return Err(retry(anyhow::anyhow!("KV live connection lost"))),
-            _ = replay_monitor.next() => return Err(retry(anyhow::anyhow!("KV replay connection lost"))),
+            _ = wait_for_disconnect(&mut live_monitor) => return Err(retry(anyhow::anyhow!("KV live connection lost"))),
+            _ = wait_for_disconnect(&mut replay_monitor) => return Err(retry(anyhow::anyhow!("KV replay connection lost"))),
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => return Err(retry(anyhow::anyhow!("KV recovery deadline exceeded"))),
             _ = tokio::time::sleep_until(replay_deadline), if is_replaying => return Err(retry(anyhow::anyhow!("KV replay timed out"))),
             _ = tokio::time::sleep_until(next_replay.unwrap_or_else(Instant::now)), if !is_replaying && next_replay.is_some() => {
-                tokio::time::timeout(INACTIVITY_TIMEOUT, replay.send(tmq::Multipart::from(vec![
+                tokio::time::timeout(INACTIVITY_TIMEOUT, replay.send(Message::multipart([
                     Vec::new(), ingest.cursor.next().to_be_bytes().to_vec(),
                 ]))).await.map_err(retry)?.map_err(retry)?;
                 is_replaying = true;
@@ -450,11 +450,11 @@ async fn recovery_session(
                 is_reply_truncated = false;
                 replay_deadline = Instant::now() + INACTIVITY_TIMEOUT;
             },
-            message = replay.next(), if is_replaying => {
-                let message = message.ok_or_else(|| retry(anyhow::anyhow!("KV replay socket ended")))?.map_err(retry)?;
+            message = replay.recv(), if is_replaying => {
+                let message = message.map_err(retry)?;
                 replay_deadline = Instant::now() + INACTIVITY_TIMEOUT;
                 // A reply in an unknown format fails the same way on every attempt.
-                match decode_replay(multipart_message(message)).map_err(fatal)? {
+                match decode_replay(message).map_err(fatal)? {
                     ReplayFrame::Batch(sequence, payload) => {
                         // A hole inside one reply is a transport drop, and a reply that starts past the cursor
                         // cannot apply yet; neither is buffered, and End confirms missing history or re-requests.
@@ -469,8 +469,11 @@ async fn recovery_session(
                         is_replaying = false;
                         // Bound each drain so a busy producer cannot starve cancellation or the round deadline.
                         for _ in 0..MAX_LIVE_DRAIN {
-                            let Some(message) = live.next().now_or_never() else { break };
-                            let message = message.ok_or_else(|| retry(anyhow::anyhow!("KV live socket ended")))?.map_err(retry)?;
+                            let message = match live.try_recv() {
+                                Ok(message) => message,
+                                Err(OmqError::WouldBlock) => break,
+                                Err(error) => return Err(retry(error)),
+                            };
                             if let Some((sequence, payload)) = live_batch(message) {
                                 ingest.apply(sequence, payload)?;
                             }
@@ -492,8 +495,8 @@ async fn recovery_session(
                     }
                 }
             },
-            message = live.next() => {
-                let message = message.ok_or_else(|| retry(anyhow::anyhow!("KV live socket ended")))?.map_err(retry)?;
+            message = live.recv() => {
+                let message = message.map_err(retry)?;
                 let Some((sequence, payload)) = live_batch(message) else { continue };
                 if sequence > ingest.cursor.next() && is_success {
                     is_success = false;
@@ -509,14 +512,16 @@ async fn recovery_session(
 #[cfg(test)]
 mod socket_tests {
     use super::*;
+    use dynamo_runtime::transports::zmq::bind_socket;
+    use omq_tokio::{Options, Socket};
     use std::sync::Arc;
-    use tmq::{AsZmqSocket, Multipart};
     use tokio::sync::{oneshot, watch};
     use tokio_util::sync::CancellationToken;
 
     struct Fixture {
-        live: tmq::publish::Publish,
-        replay: tmq::router::Router,
+        live: Socket,
+        replay: Socket,
+        replay_endpoint: String,
         inputs: mpsc::UnboundedReceiver<PublisherInput>,
         updates: watch::Receiver<KvStreamStatus>,
         commands: mpsc::Sender<KvStreamCommand>,
@@ -529,22 +534,17 @@ mod socket_tests {
         }
     }
     impl Fixture {
-        fn new(timeout: Duration) -> Self {
-            let ctx = tmq::Context::new();
-            let live = tmq::publish(&ctx)
-                .set_linger(0)
-                .bind("tcp://127.0.0.1:*")
-                .unwrap();
-            let replay = tmq::router(&ctx)
-                .set_linger(0)
-                .bind("tcp://127.0.0.1:*")
-                .unwrap();
+        async fn new(timeout: Duration) -> Self {
+            let live = new_socket(SocketType::Pub, Options::default()).unwrap();
+            let live_endpoint = bind_socket(&live, "tcp://127.0.0.1:0").await.unwrap();
+            let replay = new_socket(SocketType::Router, Options::default()).unwrap();
+            let replay_endpoint = bind_socket(&replay, "tcp://127.0.0.1:0").await.unwrap();
             let (tx, inputs) = mpsc::unbounded_channel();
             let (status, updates) = watch::channel(KvStreamStatus::Recovering);
             let (commands, receiver) = mpsc::channel(4);
             let cancel = CancellationToken::new();
             let listener = tokio::spawn(super::super::zmq_listener::start_zmq_listener(
-                live.get_socket().get_last_endpoint().unwrap().unwrap(),
+                live_endpoint,
                 String::new(),
                 1,
                 tx,
@@ -557,7 +557,7 @@ mod socket_tests {
                 None,
                 false,
                 Some(ZmqRecoveryConfig {
-                    replay_endpoint: replay.get_socket().get_last_endpoint().unwrap().unwrap(),
+                    replay_endpoint: replay_endpoint.clone(),
                     dp_rank: 0,
                     deadline: Instant::now() + timeout,
                     status,
@@ -567,6 +567,7 @@ mod socket_tests {
             Self {
                 live,
                 replay,
+                replay_endpoint,
                 inputs,
                 updates,
                 commands,
@@ -593,13 +594,11 @@ mod socket_tests {
             done.send(Ok(())).unwrap();
         }
         async fn request(&mut self, expected: u64) -> Vec<u8> {
-            let frames = tokio::time::timeout(Duration::from_secs(5), self.replay.next())
+            let frames = tokio::time::timeout(Duration::from_secs(5), self.replay.recv())
                 .await
                 .unwrap()
-                .unwrap()
                 .unwrap();
-            let frames: Vec<_> = frames.into_iter().collect();
-            assert_eq!(&frames[2][..], &expected.to_be_bytes());
+            assert_eq!(&frames[2], &expected.to_be_bytes());
             frames[0].to_vec()
         }
         async fn send(&mut self, id: &[u8], seq: i64, payload: Vec<u8>) {
@@ -610,7 +609,7 @@ mod socket_tests {
                 b"kv-events".to_vec()
             };
             self.replay
-                .send(Multipart::from(vec![
+                .send(Message::multipart([
                     id.to_vec(),
                     vec![],
                     topic,
@@ -622,7 +621,7 @@ mod socket_tests {
         }
         async fn live(&mut self, sequence: u64) {
             self.live
-                .send(Multipart::from(vec![
+                .send(Message::multipart([
                     vec![],
                     sequence.to_be_bytes().to_vec(),
                     payload(0),
@@ -679,28 +678,12 @@ mod socket_tests {
         }
         /// Closes the replay socket so the listener sees a disconnect, then binds the same port again.
         async fn restart_replay(&mut self) {
-            let endpoint = self
-                .replay
-                .get_socket()
-                .get_last_endpoint()
-                .unwrap()
+            let socket = new_socket(SocketType::Router, Options::default()).unwrap();
+            let previous = std::mem::replace(&mut self.replay, socket);
+            previous.close().await.unwrap();
+            bind_socket(&self.replay, &self.replay_endpoint)
+                .await
                 .unwrap();
-            let ctx = tmq::Context::new();
-            let placeholder = tmq::router(&ctx)
-                .set_linger(0)
-                .bind("tcp://127.0.0.1:*")
-                .unwrap();
-            drop(std::mem::replace(&mut self.replay, placeholder));
-            self.replay = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if let Ok(socket) = tmq::router(&ctx).set_linger(0).bind(&endpoint) {
-                        break socket;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .unwrap();
         }
     }
     fn payload(rank: i32) -> Vec<u8> {
@@ -710,7 +693,7 @@ mod socket_tests {
     #[tokio::test]
     async fn complete_replay_succeeds_without_live_events() {
         for is_empty in [true, false] {
-            let mut f = Fixture::new(Duration::from_secs(5));
+            let mut f = Fixture::new(Duration::from_secs(5)).await;
             let id = f.request(0).await;
             if !is_empty {
                 f.send(&id, 0, payload(0)).await;
@@ -724,7 +707,7 @@ mod socket_tests {
 
     #[tokio::test]
     async fn live_gap_after_success_is_repaired_without_reapplying_history() {
-        let mut f = Fixture::new(Duration::from_secs(5));
+        let mut f = Fixture::new(Duration::from_secs(5)).await;
         f.succeed().await;
         // A live gap revokes success until replay fills it; republish until the subscription is active.
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -759,7 +742,7 @@ mod socket_tests {
 
     #[tokio::test]
     async fn exhausted_round_restarts_and_reconnects_keep_the_cursor() {
-        let mut f = Fixture::new(Duration::from_secs(1));
+        let mut f = Fixture::new(Duration::from_secs(1)).await;
         let id = f.request(0).await;
         f.send(&id, 0, payload(0)).await;
         f.events().await;
@@ -789,7 +772,7 @@ mod socket_tests {
     async fn undecodable_and_wrong_rank_batches_are_skipped() {
         let unlabeled =
             rmp_serde::to_vec(&(0.0_f64, vec![vec!["AllBlocksCleared"]], None::<i32>)).unwrap();
-        let mut f = Fixture::new(Duration::from_secs(5));
+        let mut f = Fixture::new(Duration::from_secs(5)).await;
         let id = f.request(0).await;
         f.send(&id, 0, b"not msgpack".to_vec()).await;
         f.send(&id, 1, payload(1)).await;
@@ -805,7 +788,7 @@ mod socket_tests {
     async fn final_failures_refuse_restart() {
         for is_malformed in [false, true] {
             // A long round shows the failure is final, not an exhausted round.
-            let mut f = Fixture::new(Duration::from_secs(30));
+            let mut f = Fixture::new(Duration::from_secs(30)).await;
             let id = f.request(0).await;
             if is_malformed {
                 // A batch frame without data is an invalid end marker.
@@ -828,7 +811,7 @@ mod socket_tests {
     #[tokio::test]
     async fn confirmed_missing_history_is_distinct_from_exhausted_retries() {
         for is_reply_sent in [true, false] {
-            let mut f = Fixture::new(Duration::from_secs(1));
+            let mut f = Fixture::new(Duration::from_secs(1)).await;
             let id = f.request(0).await;
             if is_reply_sent {
                 // A late reply longer than the merge buffer, as from an engine whose buffer rolled over.
@@ -854,7 +837,7 @@ mod socket_tests {
 
     #[tokio::test]
     async fn teardown_does_not_wait_for_a_stalled_index() {
-        let mut f = Fixture::new(Duration::from_secs(5));
+        let mut f = Fixture::new(Duration::from_secs(5)).await;
         let id = f.request(0).await;
         f.send(&id, -1, vec![]).await;
         // Hold the barrier as an index blocked in application would.
@@ -868,7 +851,7 @@ mod socket_tests {
 
     #[tokio::test]
     async fn stopped_listener_does_not_leave_success_behind() {
-        let mut f = Fixture::new(Duration::from_secs(5));
+        let mut f = Fixture::new(Duration::from_secs(5)).await;
         f.succeed().await;
         // As the processor's reset fence or the supervisor stops the source.
         f.cancel.cancel();
@@ -881,7 +864,7 @@ mod socket_tests {
 
     #[tokio::test]
     async fn live_fills_hole_observed_first_on_replay() {
-        let mut f = Fixture::new(Duration::from_secs(5));
+        let mut f = Fixture::new(Duration::from_secs(5)).await;
         let id = f.request(0).await;
         f.send(&id, 1, payload(0)).await;
         // Let replay expose the hole before its live counterpart arrives.
@@ -899,7 +882,7 @@ mod socket_tests {
 
     #[tokio::test]
     async fn hole_inside_one_replay_reply_is_requested_again() {
-        let mut f = Fixture::new(Duration::from_secs(5));
+        let mut f = Fixture::new(Duration::from_secs(5)).await;
         let id = f.request(0).await;
         f.send(&id, 0, payload(0)).await;
         assert_eq!(f.events().await[0].event.event_id, 0);
@@ -923,25 +906,40 @@ mod tests {
     #[test]
     fn end_marker_is_explicit() {
         assert_eq!(
-            decode_replay(vec![
+            decode_replay(Message::multipart([
                 vec![],
                 vec![],
                 (-1_i64).to_be_bytes().to_vec(),
                 vec![]
-            ])
+            ]))
             .unwrap(),
             ReplayFrame::End
         );
-        assert!(decode_replay(vec![vec![], vec![], 0_u64.to_be_bytes().to_vec(), vec![]]).is_err());
-        assert!(decode_replay(vec![vec![], 0_u64.to_be_bytes().to_vec(), vec![1]]).is_err());
-        assert!(decode_replay(vec![]).is_err());
+        assert!(
+            decode_replay(Message::multipart([
+                vec![],
+                vec![],
+                0_u64.to_be_bytes().to_vec(),
+                vec![]
+            ]))
+            .is_err()
+        );
+        assert!(
+            decode_replay(Message::multipart([
+                vec![],
+                0_u64.to_be_bytes().to_vec(),
+                vec![1]
+            ]))
+            .is_err()
+        );
+        assert!(decode_replay(Message::default()).is_err());
     }
     #[test]
     fn expired_history_and_buffer_bounds() {
         let mut cursor = ReplayCursor::new(2);
-        cursor.insert(500, vec![1, 1]).unwrap();
+        cursor.insert(500, Bytes::from_static(&[1, 1])).unwrap();
         assert_eq!(cursor.gap(), Some((0, 500)));
-        cursor.insert(500, vec![1, 1]).unwrap();
-        assert!(cursor.insert(501, vec![2]).is_err());
+        cursor.insert(500, Bytes::from_static(&[1, 1])).unwrap();
+        assert!(cursor.insert(501, Bytes::from_static(&[2])).is_err());
     }
 }

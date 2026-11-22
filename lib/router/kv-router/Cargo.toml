@@ -17,8 +17,8 @@ default = []
 # Adapters. The composition (flat config, plugin registry, SelectionServiceBuilder) never
 # needs a transport crate; each adapter brings its own.
 http = ["dep:axum", "dep:chrono", "dep:tracing-appender"]
-ingest-zmq = ["dep:zmq"]
-replica-sync-zmq = ["dep:zmq"]
+ingest-zmq = ["dep:omq-tokio"]
+replica-sync-zmq = ["dep:omq-tokio"]
 peer-recovery = ["dep:reqwest"]
 metrics = ["dep:prometheus", "dynamo-kv-indexer/export"]
 bench = ["dynamo-admission/bench", "dynamo-scheduler/bench", "dynamo-router-protocol/bench", "dynamo-kv-indexer/bench", "dynamo-worker-selection/bench"]
@@ -54,7 +54,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-zmq = { workspace = true, optional = true }
+omq-tokio = { workspace = true, optional = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
 

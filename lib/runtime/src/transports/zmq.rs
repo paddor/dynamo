@@ -5,8 +5,7 @@
 //!
 //! This module provides a ZMQ transport for the [crate::DistributedRuntime].
 //!
-//! Currently, the [Server] consists of a [tmq::router::Router] and the [Client] leverages
-//! a [tmq::dealer::Dealer].
+//! The [Server] and [Client] communicate over OMQ ROUTER and DEALER sockets.
 //!
 //! The distributed service pattern we will use is based on the Harmony pattern described in
 //! [Chapter 8: A Framework for Distributed Computing](https://zguide.zeromq.org/docs/chapter8/#True-Peer-Connectivity-Harmony-Pattern).
@@ -19,10 +18,11 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use derive_getters::Dissolve;
-use futures::{SinkExt, StreamExt};
+use omq_tokio::{Context as OmqContext, ContextConfig, Options, Socket, SocketType};
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::{collections::HashMap, sync::Arc};
-use tmq::{AsZmqSocket, Context as TmqContext, dealer, router};
 use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
@@ -33,9 +33,7 @@ pub type MultipartMessage = Vec<Vec<u8>>;
 
 /// Returns whether `endpoint` needs `ZMQ_IPV6`.
 ///
-/// Set the option before each bind or connect; libzmq applies it per connection.
-/// Rejects unbracketed IPv6 literals: without `ZMQ_IPV6`, libzmq resolves them
-/// as IPv4 and retries the connection forever without reporting an error.
+/// Rejects unbracketed IPv6 literals before a socket starts reconnecting.
 pub fn ipv6_option_for(endpoint: &str) -> Result<bool> {
     let Some(address) = endpoint.strip_prefix("tcp://") else {
         return Ok(false);
@@ -51,6 +49,66 @@ pub fn ipv6_option_for(endpoint: &str) -> Result<bool> {
         );
     }
     Ok(false)
+}
+
+/// Create an OMQ socket for Dynamo transports on the caller's runtime,
+/// or on a shared I/O runtime when `DYN_ZMQ_IO_THREADS` is configured.
+pub fn new_socket(socket_type: SocketType, options: Options) -> Result<Socket> {
+    match configured_context()? {
+        Some(context) => Ok(context.socket(socket_type, options)),
+        None => Ok(Socket::try_new(socket_type, options)?),
+    }
+}
+
+/// Create a socket that can outlive the runtime that creates it.
+pub(super) fn new_owned_socket(socket_type: SocketType, options: Options) -> Result<Socket> {
+    static DEFAULT_CONTEXT: OnceCell<OmqContext> = OnceCell::new();
+    let context =
+        configured_context()?.unwrap_or_else(|| DEFAULT_CONTEXT.get_or_init(|| new_context(4)));
+    Ok(context.socket(socket_type, options))
+}
+
+fn configured_context() -> Result<Option<&'static OmqContext>> {
+    static CONTEXT: OnceCell<Option<OmqContext>> = OnceCell::new();
+    let context = CONTEXT.get_or_try_init(|| {
+        let value = std::env::var_os("DYN_ZMQ_IO_THREADS");
+        let threads = value.as_deref().map(parse_io_threads).transpose()?;
+        Ok::<_, anyhow::Error>(threads.map(new_context))
+    })?;
+    Ok(context.as_ref())
+}
+
+fn new_context(io_threads: usize) -> OmqContext {
+    OmqContext::with_config_and_name(ContextConfig { io_threads }, "dynamo-omq")
+}
+
+fn parse_io_threads(value: &OsStr) -> Result<usize> {
+    let threads = value
+        .to_str()
+        .context("DYN_ZMQ_IO_THREADS must be valid UTF-8")?
+        .parse::<i32>()
+        .context("DYN_ZMQ_IO_THREADS must be a positive integer")?;
+    anyhow::ensure!(threads > 0, "DYN_ZMQ_IO_THREADS must be a positive integer");
+    Ok(threads as usize)
+}
+
+/// Connect an OMQ socket using the Dynamo endpoint conventions.
+pub async fn connect_socket(socket: &Socket, endpoint: &str) -> Result<()> {
+    ipv6_option_for(endpoint)?;
+    socket
+        .connect(endpoint)
+        .await
+        .with_context(|| format!("Failed to connect ZMQ socket to {endpoint}"))
+}
+
+/// Bind an OMQ socket and return its resolved endpoint.
+pub async fn bind_socket(socket: &Socket, endpoint: &str) -> Result<String> {
+    ipv6_option_for(endpoint)?;
+    let endpoint = socket
+        .bind(endpoint)
+        .await
+        .with_context(|| format!("Failed to bind ZMQ socket to {endpoint}"))?;
+    Ok(endpoint.to_string())
 }
 
 // Core message types
@@ -109,12 +167,11 @@ impl RouterState {
 pub struct Server {
     state: Arc<Mutex<RouterState>>,
     cancel_token: CancellationToken,
-    fd: i32,
+    endpoint: String,
 }
 
 impl Server {
-    /// Create a new [Server] which is a [tmq::router::Router] with the given [tmq::Context]
-    /// and address to bind the ZMQ router socket.
+    /// Create a new [Server] and bind its OMQ ROUTER socket to the address.
     ///
     /// If the event loop processing the router fails with an error, the signal is propagated through the [CancellationToken]
     /// by issuing a [CancellationToken::cancel].
@@ -123,12 +180,12 @@ impl Server {
     ///
     /// The [ServerExecutionHandle] is the handle for background task executing the [Server].
     pub async fn new(
-        context: &TmqContext,
+        context: &OmqContext,
         address: &str,
         cancel_token: CancellationToken,
     ) -> Result<(Self, ServerExecutionHandle)> {
-        let router = router(context).bind(address)?;
-        let fd = router.get_socket().get_fd()?;
+        let router = context.socket(SocketType::Router, Options::default());
+        let endpoint = bind_socket(&router, address).await?;
         let state = Arc::new(Mutex::new(RouterState::new()));
 
         // can cancel the router's event loop
@@ -157,7 +214,7 @@ impl Server {
             Self {
                 state,
                 cancel_token: child,
-                fd,
+                endpoint,
             },
             handle,
         ))
@@ -166,43 +223,15 @@ impl Server {
     // pub async fn register_stream(&)
 
     async fn run(
-        router: tmq::router::Router,
+        router: Socket,
         state: Arc<Mutex<RouterState>>,
         token: CancellationToken,
     ) -> Result<()> {
-        let mut router = router;
-
-        // todo - move this into the Server impl to discover the os port being used
-        // let fd = router.as_raw_socket().get_fd()?;
-        // let sock = unsafe { socket2::Socket::from_raw_fd(fd) };
-        // let addr = sock.local_addr()?;
-        // let port = addr.as_socket().map(|s| s.port());
-
-        // if let Some(port) = port {
-        //     tracing::info!("Server listening on port {port}");
-        // }
-
         loop {
             let frames = tokio::select! {
                 biased;
-
-                frames = router.next() => {
-                    match frames {
-                        Some(Ok(frames)) => {
-                            frames
-                        },
-                        Some(Err(e)) => {
-                            tracing::warn!("Error receiving message: {e}");
-                            continue;
-                        }
-                        None => break,
-                    }
-                }
-
-                _ = token.cancelled() => {
-                    tracing::info!("Server shutting down");
-                    break;
-                }
+                _ = token.cancelled() => break,
+                frames = router.recv() => frames?,
             };
 
             // we should have at least 3 frames
@@ -322,59 +351,35 @@ impl ServerExecutionHandle {
 
 // Client implementation
 pub struct Client {
-    dealer: tmq::dealer::Dealer,
+    dealer: Socket,
 }
 
 impl Client {
-    fn new(context: &TmqContext, address: &str) -> Result<Self> {
-        let dealer = dealer(context).connect(address)?;
-
+    /// Connect a DEALER to a ZMQ request server.
+    pub async fn new(context: &OmqContext, address: &str) -> Result<Self> {
+        let dealer = context.socket(SocketType::Dealer, Options::default());
+        connect_socket(&dealer, address).await?;
         Ok(Self { dealer })
     }
 
-    fn dealer(&mut self) -> &mut tmq::dealer::Dealer {
-        &mut self.dealer
+    /// Access the DEALER socket for multipart requests.
+    pub fn dealer(&self) -> &Socket {
+        &self.dealer
     }
-
-    // async fn send_data(&self, data: Vec<u8>) -> Result<()> {
-    //     let msg_type = MessageType::Data(data);
-    //     let type_bytes = serde_json::to_vec(&msg_type)?;
-
-    //     self.dealer
-    //         .send_multipart(&[type_bytes, self.request_id.as_bytes().to_vec()])
-    //         .await
-    //         .map_err(|e| anyhow!("Failed to send data: {}", e))
-    // }
-
-    // async fn send_control(&self, msg: ControlMessage) -> Result<()> {
-    //     let msg_type = MessageType::Control(msg);
-    //     let type_bytes = serde_json::to_vec(&msg_type)?;
-
-    //     self.dealer
-    //         .send_multipart(&[type_bytes])
-    //         .await
-    //         .map_err(|e| anyhow!("Failed to send control message: {}", e))
-    // }
-
-    // async fn receive(&self) -> Result<MessageType> {
-    //     let frames = self
-    //         .dealer
-    //         .recv_multipart()
-    //         .await
-    //         .map_err(|e| anyhow!("Failed to receive message: {}", e))?;
-
-    //     if frames.is_empty() {
-    //         return Err(anyhow!("Received empty message"));
-    //     }
-
-    //     serde_json::from_slice(&frames[0])
-    //         .map_err(|e| anyhow!("Failed to deserialize message: {}", e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::time::timeout;
+
+    #[test]
+    fn parses_io_thread_override() {
+        assert_eq!(parse_io_threads(OsStr::new("4")).unwrap(), 4);
+        for value in ["0", "invalid", "2147483648"] {
+            assert!(parse_io_threads(OsStr::new(value)).is_err());
+        }
+    }
 
     #[test]
     fn ipv6_option_follows_endpoint_address_family() {
@@ -402,8 +407,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_communication() -> Result<()> {
-        let context = TmqContext::new();
-        let address = "tcp://127.0.0.1:1337";
+        let context = OmqContext::current();
+        let address = "tcp://127.0.0.1:0";
         let token = CancellationToken::new();
 
         // Start server
@@ -415,17 +420,17 @@ mod tests {
         state.lock().await.active_streams.insert(id.clone(), tx);
 
         // Create client
-        let mut client = Client::new(&context, address)?;
+        let client = Client::new(&context, &server.endpoint).await?;
 
         client
             .dealer()
-            .send(tmq::Multipart::from(vec![
+            .send(omq_tokio::Message::multipart([
                 id.as_bytes().to_vec(),
                 id.as_bytes().to_vec(),
             ]))
             .await?;
 
-        let receive_result = rx.recv().await;
+        let receive_result = timeout(std::time::Duration::from_secs(3), rx.recv()).await?;
 
         let received = receive_result.unwrap();
 

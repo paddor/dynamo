@@ -51,7 +51,6 @@ use dynamo_runtime::{
     traits::DistributedRuntimeProvider,
     transports::event_plane::{EventPublisher, SharedZmqPublisherSocket},
 };
-use futures::StreamExt;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -67,7 +66,7 @@ use crate::{
         indexer::{KvStateAgentStatusCell, start_worker_kv_query_endpoint_with_status},
         metrics::kv_publisher_metrics,
     },
-    utils::zmq::{MultipartMessage, SubSocket, connect_sub_socket, multipart_message},
+    utils::zmq::{SubSocket, connect_sub_socket},
 };
 
 use super::{
@@ -1677,15 +1676,9 @@ enum RawSubscription {
 }
 
 impl RawSubscription {
-    async fn next(&mut self) -> Option<Result<MultipartMessage>> {
+    async fn next(&mut self) -> Option<Result<RawZmqFrames>> {
         match self {
-            Self::Dedicated(socket) => Some(
-                socket
-                    .next()
-                    .await?
-                    .map(multipart_message)
-                    .map_err(Into::into),
-            ),
+            Self::Dedicated(socket) => Some(socket.recv().await.map_err(Into::into)),
             Self::Pooled(route) => tokio::select! {
                 biased;
                 frames = route.receiver.recv() => frames.map(Ok),

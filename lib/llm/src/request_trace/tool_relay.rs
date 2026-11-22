@@ -12,10 +12,9 @@ use anyhow::Result;
 use dynamo_runtime::component::Component;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use dynamo_runtime::transports::event_plane::EventPublisher;
-use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::utils::zmq::{PullSocket, bind_pull_socket, multipart_message};
+use crate::utils::zmq::{PullSocket, bind_pull_socket};
 
 use super::DEFAULT_TOOL_EVENTS_TOPIC;
 use crate::request_trace::{RequestTraceRecord, RequestTraceToolEventIngress};
@@ -59,7 +58,7 @@ impl ToolEventRelay {
     }
 
     async fn relay_loop(
-        mut socket: PullSocket,
+        socket: PullSocket,
         zmq_topic: Option<String>,
         publisher: EventPublisher,
         cancel: CancellationToken,
@@ -71,10 +70,9 @@ impl ToolEventRelay {
                     tracing::info!("request trace tool relay: shutting down");
                     break;
                 }
-                result = socket.next() => {
+                result = socket.recv() => {
                     match result {
-                        Some(Ok(frames)) => {
-                            let mut frames = multipart_message(frames);
+                        Ok(frames) => {
                             if frames.len() != 3 {
                                 tracing::warn!(
                                     "request trace tool relay: unexpected ZMQ frame count: expected 3, got {}",
@@ -84,7 +82,7 @@ impl ToolEventRelay {
                             }
 
                             if let Some(expected_topic) = zmq_topic.as_deref()
-                                && frames[0].as_slice() != expected_topic.as_bytes()
+                                && &frames[0] != expected_topic.as_bytes()
                             {
                                 tracing::debug!(
                                     expected_topic = expected_topic,
@@ -94,8 +92,8 @@ impl ToolEventRelay {
                                 continue;
                             }
 
-                            let payload = frames.swap_remove(2);
-                            let ingress = match rmp_serde::from_slice::<RequestTraceToolEventIngress>(&payload) {
+                            let payload = &frames[2];
+                            let ingress = match rmp_serde::from_slice::<RequestTraceToolEventIngress>(payload) {
                                 Ok(ingress) => ingress,
                                 Err(error) => {
                                     tracing::warn!(%error, bytes = payload.len(), "request trace tool relay: failed to decode ingress payload");
@@ -113,12 +111,8 @@ impl ToolEventRelay {
                                 tracing::warn!(%error, "request trace tool relay: event plane publish failed");
                             }
                         }
-                        Some(Err(error)) => {
+                        Err(error) => {
                             tracing::error!(%error, "request trace tool relay: ZMQ recv failed");
-                            break;
-                        }
-                        None => {
-                            tracing::error!("request trace tool relay: ZMQ stream ended");
                             break;
                         }
                     }
@@ -150,7 +144,7 @@ mod tests {
         RequestTraceEventSource, RequestTraceEventType, RequestTraceSchema, RequestTraceToolEvent,
         RequestTraceToolStatus,
     };
-    use crate::utils::zmq::{connect_push_socket, send_multipart_direct};
+    use crate::utils::zmq::{connect_push_socket, send_multipart};
 
     fn reserve_open_port() -> TcpListener {
         TcpListener::bind("127.0.0.1:0").expect("failed to reserve TCP port")
@@ -214,7 +208,7 @@ mod tests {
                 let component = namespace.component("worker")?;
                 let relay =
                     ToolEventRelay::start(component, endpoint.clone(), None, None, None).await?;
-                let mut push_socket = connect_push_socket(&endpoint).await?;
+                let push_socket = connect_push_socket(&endpoint).await?;
                 let mut subscriber =
                     EventSubscriber::for_namespace(&namespace, DEFAULT_TOOL_EVENTS_TOPIC)
                         .await?
@@ -224,8 +218,8 @@ mod tests {
 
                 let payload = rmp_serde::to_vec_named(&valid_ingress())?;
                 for _ in 0..5 {
-                    send_multipart_direct(
-                        &mut push_socket,
+                    send_multipart(
+                        &push_socket,
                         vec![Vec::new(), 1u64.to_be_bytes().to_vec(), payload.clone()],
                     )
                     .await?;
@@ -272,8 +266,8 @@ mod tests {
                 let component = namespace.component("worker")?;
                 let relay =
                     ToolEventRelay::start(component, endpoint.clone(), None, None, None).await?;
-                let mut first_push = connect_push_socket(&endpoint).await?;
-                let mut second_push = connect_push_socket(&endpoint).await?;
+                let first_push = connect_push_socket(&endpoint).await?;
+                let second_push = connect_push_socket(&endpoint).await?;
                 let mut subscriber =
                     EventSubscriber::for_namespace(&namespace, DEFAULT_TOOL_EVENTS_TOPIC)
                         .await?
@@ -285,13 +279,13 @@ mod tests {
                     rmp_serde::to_vec_named(&valid_ingress_with_tool_call_id("tool-first"))?;
                 let second_payload =
                     rmp_serde::to_vec_named(&valid_ingress_with_tool_call_id("tool-second"))?;
-                send_multipart_direct(
-                    &mut first_push,
+                send_multipart(
+                    &first_push,
                     vec![Vec::new(), 1u64.to_be_bytes().to_vec(), first_payload],
                 )
                 .await?;
-                send_multipart_direct(
-                    &mut second_push,
+                send_multipart(
+                    &second_push,
                     vec![Vec::new(), 1u64.to_be_bytes().to_vec(), second_payload],
                 )
                 .await?;
@@ -370,7 +364,7 @@ mod tests {
                     None,
                 )
                 .await?;
-                let mut push_socket = connect_push_socket(&endpoint).await?;
+                let push_socket = connect_push_socket(&endpoint).await?;
                 let mut subscriber =
                     EventSubscriber::for_namespace(&namespace, DEFAULT_TOOL_EVENTS_TOPIC)
                         .await?
@@ -383,8 +377,8 @@ mod tests {
                 let accepted_payload =
                     rmp_serde::to_vec_named(&valid_ingress_with_tool_call_id("tool-accepted"))?;
 
-                send_multipart_direct(
-                    &mut push_socket,
+                send_multipart(
+                    &push_socket,
                     vec![
                         b"other-tools".to_vec(),
                         1u64.to_be_bytes().to_vec(),
@@ -392,8 +386,8 @@ mod tests {
                     ],
                 )
                 .await?;
-                send_multipart_direct(
-                    &mut push_socket,
+                send_multipart(
+                    &push_socket,
                     vec![
                         b"matching-tools".to_vec(),
                         2u64.to_be_bytes().to_vec(),

@@ -17,9 +17,9 @@ use dynamo_router_protocol::worker::{WorkerId, WorkerWithDpRank};
 
 use super::backend::Indexer;
 use super::registry::ListenerRecord;
-use crate::services::common::zmq::{
-    MultipartMessage, ZmqSocket, connect_dealer_socket, connect_sub_socket,
-};
+use omq_tokio::{Message, Socket};
+
+use crate::services::common::zmq::{connect_dealer_socket, connect_sub_socket};
 
 const WATERMARK_UNSET: u64 = u64::MAX;
 
@@ -183,7 +183,7 @@ struct ListenerLoop {
     dp_rank: u32,
     indexer: Indexer,
     cancel: CancellationToken,
-    live_socket: ZmqSocket,
+    live_socket: Socket,
     /// Dialed per replay: an idle DEALER per worker rank would hold a ZMQ socket for each
     /// source for its whole life, while replays only happen at startup and on gaps.
     replay_endpoint: Option<String>,
@@ -204,7 +204,7 @@ impl ListenerLoop {
         idempotent_stores: bool,
         indexer: Indexer,
         cancel: CancellationToken,
-        live_socket: ZmqSocket,
+        live_socket: Socket,
         replay_endpoint: Option<String>,
         watermark: Arc<AtomicU64>,
     ) -> Self {
@@ -290,7 +290,7 @@ impl ListenerLoop {
         if self.cancel.is_cancelled() {
             return Ok(0);
         }
-        let mut replay_socket = match connect_dealer_socket(replay_endpoint) {
+        let replay_socket = match connect_dealer_socket(replay_endpoint).await {
             Ok(socket) => socket,
             Err(error) => {
                 tracing::error!(
@@ -306,8 +306,11 @@ impl ListenerLoop {
         let worker_id = self.worker_id;
         let dp_rank = self.dp_rank;
 
-        let req_frames = vec![Vec::new(), start_seq.to_be_bytes().to_vec()];
-        if let Err(error) = replay_socket.send_multipart(req_frames).await {
+        let req_frames = Message::multipart_payloads([
+            omq_tokio::Payload::new(),
+            omq_tokio::Payload::from_slice(&start_seq.to_be_bytes()),
+        ]);
+        if let Err(error) = replay_socket.send(req_frames).await {
             tracing::error!(worker_id, dp_rank, error = %error, "Failed to send replay request");
             return Ok(0);
         }
@@ -316,7 +319,7 @@ impl ListenerLoop {
         loop {
             let msg = tokio::select! {
                 _ = self.cancel.cancelled() => break,
-                result = replay_socket.recv_multipart() => {
+                result = replay_socket.recv() => {
                     match result {
                         Ok(msg) => msg,
                         Err(error) => {
@@ -328,8 +331,9 @@ impl ListenerLoop {
             };
             // DEALER strips the ROUTER identity. vLLM includes the PUB topic;
             // SGLang sends only the delimiter, sequence number, and payload.
-            let (seq_bytes, payload) = match msg.as_slice() {
-                [_, seq, payload] | [_, _, seq, payload] => (seq, payload),
+            let (seq_bytes, payload) = match msg.len() {
+                3 => (&msg[1], &msg[2]),
+                4 => (&msg[2], &msg[3]),
                 _ => {
                     tracing::warn!(
                         worker_id,
@@ -435,7 +439,7 @@ impl ListenerLoop {
         Ok(())
     }
 
-    async fn handle_message(&mut self, msg: MultipartMessage) -> Result<(), String> {
+    async fn handle_message(&mut self, msg: Message) -> Result<(), String> {
         if msg.len() != 3 {
             tracing::warn!(
                 self.worker_id,
@@ -483,7 +487,7 @@ impl ListenerLoop {
                     return Ok(());
                 }
 
-                result = self.live_socket.recv_multipart() => {
+                result = self.live_socket.recv() => {
                     match result {
                         Ok(msg) => msg,
                         Err(error) => {
@@ -550,6 +554,7 @@ async fn run_listener(
     }
 
     let socket = connect_sub_socket(&endpoint)
+        .await
         .map_err(|e| format!("failed to connect ZMQ SUB socket to {endpoint}: {e}"))?;
 
     tokio::select! {
@@ -595,6 +600,7 @@ mod tests {
     use super::*;
     use crate::services::indexer::backend::create_indexer;
     use dynamo_kv_hashing::routing::compute_block_hash_for_seq;
+    use omq_tokio::{Options, SocketType};
     use std::time::Duration;
 
     fn batch<T: serde::Serialize>(event: T) -> Vec<u8> {
@@ -602,40 +608,40 @@ mod tests {
     }
 
     /// Answers one replay request with `batches`, numbered from 0, then the end marker.
-    fn spawn_replay_server(
-        context: &zmq::Context,
+    async fn spawn_replay_server(
         batches: Vec<Vec<u8>>,
         include_topic: bool,
     ) -> (
         String,
-        std::sync::mpsc::Sender<()>,
+        tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
     ) {
-        let router = context.socket(zmq::ROUTER).unwrap();
-        router.set_linger(0).unwrap();
-        router.set_rcvtimeo(5000).unwrap();
-        router.set_sndtimeo(5000).unwrap();
-        router.bind("tcp://127.0.0.1:*").unwrap();
-        let endpoint = router.get_last_endpoint().unwrap().unwrap();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let server = tokio::task::spawn_blocking(move || {
-            let request = router.recv_multipart(0).unwrap();
-            assert_eq!(&request[1..], &[vec![], 0_u64.to_be_bytes().to_vec()]);
+        let router = Socket::new(SocketType::Router, Options::default());
+        let endpoint = router.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let request = tokio::time::timeout(Duration::from_secs(5), router.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.len(), 3);
+            assert!(request[1].is_empty());
+            assert_eq!(&request[2], &0_u64.to_be_bytes());
             let replies = batches
                 .into_iter()
                 .enumerate()
                 .map(|(seq, payload)| ((seq as u64).to_be_bytes().to_vec(), payload))
                 .chain([(u64::MAX.to_be_bytes().to_vec(), vec![])]);
             for (seq, payload) in replies {
-                let mut frames = vec![request[0].clone(), vec![]];
+                let mut frames = vec![request[0].to_vec(), vec![]];
                 if include_topic {
                     frames.push(b"kv-events".to_vec());
                 }
                 frames.extend([seq, payload]);
-                router.send_multipart(frames, 0).unwrap();
+                router.send(Message::multipart(frames)).await.unwrap();
             }
             // Keep the socket open until the client consumes the queued replies.
-            done_rx.recv().unwrap();
+            done_rx.await.unwrap();
         });
         (endpoint, done_tx, server)
     }
@@ -645,7 +651,6 @@ mod tests {
     #[case::vllm(true)]
     #[tokio::test]
     async fn replay_accepts_engine_framing(#[case] include_topic: bool) {
-        let context = zmq::Context::new();
         let batches = (0_u64..2)
             .map(|seq| {
                 batch((
@@ -659,11 +664,14 @@ mod tests {
                 ))
             })
             .collect();
-        let (endpoint, done_tx, server) = spawn_replay_server(&context, batches, include_topic);
-        let publisher = context.socket(zmq::PUB).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
-        let live_socket =
-            connect_sub_socket(&publisher.get_last_endpoint().unwrap().unwrap()).unwrap();
+        let (endpoint, done_tx, server) = spawn_replay_server(batches, include_topic).await;
+        let publisher = Socket::new(SocketType::Pub, Options::default());
+        let live_endpoint = publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .unwrap()
+            .to_string();
+        let live_socket = connect_sub_socket(&live_endpoint).await.unwrap();
         let indexer = create_indexer(4, 1);
         let watermark = Arc::new(AtomicU64::new(WATERMARK_UNSET));
         let cancel = CancellationToken::new();
@@ -694,16 +702,18 @@ mod tests {
         cancel.cancel();
     }
 
-    fn test_listener(
-        context: &zmq::Context,
+    async fn test_listener(
         indexer: Indexer,
         replay_endpoint: Option<String>,
         idempotent_stores: bool,
-    ) -> (ListenerLoop, zmq::Socket) {
-        let publisher = context.socket(zmq::PUB).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
-        let live_socket =
-            connect_sub_socket(&publisher.get_last_endpoint().unwrap().unwrap()).unwrap();
+    ) -> (ListenerLoop, Socket) {
+        let publisher = Socket::new(SocketType::Pub, Options::default());
+        let endpoint = publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .unwrap()
+            .to_string();
+        let live_socket = connect_sub_socket(&endpoint).await.unwrap();
         let listener = ListenerLoop::new(
             1,
             0,
@@ -744,9 +754,8 @@ mod tests {
 
     #[tokio::test]
     async fn block_stays_indexed_until_its_last_copy_is_removed() {
-        let context = zmq::Context::new();
         let indexer = create_indexer(4, 1);
-        let (mut listener, _publisher) = test_listener(&context, indexer.clone(), None, false);
+        let (mut listener, _publisher) = test_listener(indexer.clone(), None, false).await;
 
         let batches = [store_block(), store_block(), remove_block()];
         for (seq, payload) in batches.iter().enumerate() {
@@ -764,9 +773,8 @@ mod tests {
     /// SGLang sends one remove per block however many times it stored it.
     #[tokio::test]
     async fn idempotent_source_unindexes_a_block_on_its_only_remove() {
-        let context = zmq::Context::new();
         let indexer = create_indexer(4, 1);
-        let (mut listener, _publisher) = test_listener(&context, indexer.clone(), None, true);
+        let (mut listener, _publisher) = test_listener(indexer.clone(), None, true).await;
 
         let batches = [store_block(), store_block(), remove_block()];
         for (seq, payload) in batches.iter().enumerate() {
@@ -786,12 +794,11 @@ mod tests {
         #[case] idempotent_stores: bool,
         #[case] expected: Option<u32>,
     ) {
-        let context = zmq::Context::new();
         let batches = vec![store_block(), store_block(), remove_block()];
-        let (endpoint, done_tx, server) = spawn_replay_server(&context, batches, false);
+        let (endpoint, done_tx, server) = spawn_replay_server(batches, false).await;
         let indexer = create_indexer(4, 1);
         let (mut listener, _publisher) =
-            test_listener(&context, indexer.clone(), Some(endpoint), idempotent_stores);
+            test_listener(indexer.clone(), Some(endpoint), idempotent_stores).await;
 
         let replayed = tokio::time::timeout(Duration::from_secs(5), listener.replay_gap(0, 3))
             .await
@@ -808,12 +815,11 @@ mod tests {
     /// count toward later live removes.
     #[tokio::test]
     async fn live_removes_count_copies_stored_during_replay() {
-        let context = zmq::Context::new();
         let batches = vec![store_block(), store_block()];
-        let (endpoint, done_tx, server) = spawn_replay_server(&context, batches, false);
+        let (endpoint, done_tx, server) = spawn_replay_server(batches, false).await;
         let indexer = create_indexer(4, 1);
         let (mut listener, _publisher) =
-            test_listener(&context, indexer.clone(), Some(endpoint), false);
+            test_listener(indexer.clone(), Some(endpoint), false).await;
 
         let replayed = tokio::time::timeout(Duration::from_secs(5), listener.replay_gap(0, 2))
             .await

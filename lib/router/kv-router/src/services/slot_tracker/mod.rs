@@ -38,7 +38,8 @@ pub async fn run_server(config: SlotTrackerConfig) -> anyhow::Result<()> {
         config.replica_sync_port,
         &config.replica_sync_peers,
         cancel_token.child_token(),
-    )?;
+    )
+    .await?;
     let (registry, replica) = if let Some(replica_runtime) = replica_runtime {
         let replica_config = replica_runtime.config();
         let process_id = replica_config.process_id();
@@ -47,15 +48,18 @@ pub async fn run_server(config: SlotTrackerConfig) -> anyhow::Result<()> {
             replica_config,
         ));
         let dispatch_registry = Arc::downgrade(&registry);
-        let peer_manager = Arc::new(PeerManager::start(
-            config.replica_sync_peers,
-            cancel_token.child_token(),
-            move |event| {
-                if let Some(registry) = dispatch_registry.upgrade() {
-                    registry.dispatch_replica_event(event);
-                }
-            },
-        )?);
+        let peer_manager = Arc::new(
+            PeerManager::start(
+                config.replica_sync_peers,
+                cancel_token.child_token(),
+                move |event| {
+                    if let Some(registry) = dispatch_registry.upgrade() {
+                        registry.dispatch_replica_event(event);
+                    }
+                },
+            )
+            .await?,
+        );
         tracing::info!(
             port = config.port,
             replica_sync_port = config.replica_sync_port,

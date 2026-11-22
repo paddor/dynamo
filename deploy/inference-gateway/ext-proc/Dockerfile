@@ -32,15 +32,12 @@ ARG SCCACHE_REGION=""
 # protobuf-compiler provides protoc; libprotobuf-dev provides the well-known
 # .proto files (google/protobuf/struct.proto etc.) that our vendored Envoy
 # protos import. libclang-dev is needed by bindgen (nixl-sys transitive dep).
-# libzmq3-dev + pkg-config are needed by the `zmq` crate the in-process
-# selection service uses for KV-event and replica-sync sockets.
 # python3 runs container/compliance/cargo_sbom.py in the build RUN below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     protobuf-compiler \
     libprotobuf-dev \
     libclang-dev \
-    libzmq3-dev \
     pkg-config \
     python3 \
     && rm -rf /var/lib/apt/lists/*
@@ -112,12 +109,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
 # =============================================================================
 FROM ${BASE_IMAGE}
 
-# libzmq5 is the runtime library for the embedded selector's ZMQ KV-event
-# subscriber (harmless if the binary was built HTTP-only).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libstdc++6 \
-    libzmq5 \
     && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1 \
     && rm -rf /var/lib/apt/lists/*
 

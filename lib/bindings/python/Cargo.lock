@@ -1222,16 +1222,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfg-expr"
-version = "0.15.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d067ad48b8650848b989a59a86c6c36a995d02d2bf778d45c3c5d57bc2718f02"
-dependencies = [
- "smallvec",
- "target-lexicon",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1558,19 +1548,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "crossbeam"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
-dependencies = [
- "crossbeam-channel",
- "crossbeam-deque",
- "crossbeam-epoch",
- "crossbeam-queue",
- "crossbeam-utils",
 ]
 
 [[package]]
@@ -1966,17 +1943,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dircpy"
-version = "0.3.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebcbec2b9a580ddee352ac38523d2ecd4dcaad53532957034394556909e27f4b"
-dependencies = [
- "jwalk",
- "log",
- "walkdir",
-]
-
-[[package]]
 name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2252,6 +2218,7 @@ dependencies = [
  "dynamo-worker-selection",
  "fastrand",
  "http 1.4.2",
+ "omq-tokio",
  "parking_lot",
  "prometheus",
  "reqwest 0.12.28",
@@ -2267,7 +2234,6 @@ dependencies = [
  "tracing-appender",
  "uuid",
  "zeroize",
- "zmq",
 ]
 
 [[package]]
@@ -2344,6 +2310,7 @@ dependencies = [
  "moka",
  "ndarray 0.16.1",
  "object_store 0.12.5",
+ "omq-tokio",
  "oneshot",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -2363,7 +2330,6 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "thiserror 2.0.21",
- "tmq",
  "tokenizers",
  "tokio",
  "tokio-rayon",
@@ -2384,7 +2350,6 @@ dependencies = [
  "validator",
  "video-rs",
  "xxhash-rust",
- "zmq",
 ]
 
 [[package]]
@@ -2465,13 +2430,13 @@ dependencies = [
  "ndarray 0.16.1",
  "ndarray-interp",
  "ndarray-npy",
+ "omq-tokio",
  "parking_lot",
  "rmp-serde",
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
  "serde_path_to_error",
- "tmq",
  "tokio",
  "tokio-timerfd",
  "tokio-util",
@@ -2759,7 +2724,6 @@ dependencies = [
  "sha2 0.10.9",
  "socket2 0.5.10",
  "thiserror 2.0.21",
- "tmq",
  "tokio",
  "tokio-rayon",
  "tokio-rustls",
@@ -3303,9 +3267,9 @@ dependencies = [
 
 [[package]]
 name = "fanring"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "822dd8c68f1f0b90a3c2d60a21f703f125cae4c7feecdb259ea8548b274667ad"
+checksum = "c6e4e1667d04b51f74904b2bff5245040f3effdb70ef0fc8b0bb9c7d5e7598be"
 dependencies = [
  "arc-swap",
  "atomic-waker",
@@ -4891,16 +4855,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jwalk"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2735847566356cd2179a2a38264839308f7079fa96e6bd5a42d740460e003c56"
-dependencies = [
- "crossbeam",
- "rayon",
-]
-
-[[package]]
 name = "k8s-openapi"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6336,9 +6290,9 @@ dependencies = [
 
 [[package]]
 name = "omq-proto"
-version = "0.40.2"
+version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db6f0a9ef3a3a86a56522c00583524899d3f340933a1073b57ecbd3f86d8d3e4"
+checksum = "8de42c72d1af77214e0b5eeab072fed7cda19ffaa12a3dd0071fc54db4046de4"
 dependencies = [
  "bytes",
  "concurrent-queue",
@@ -6352,9 +6306,9 @@ dependencies = [
 
 [[package]]
 name = "omq-shm"
-version = "0.8.2"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b9e5d88a7e53d9a2a50b55d544c853718dcebbfd6e0e982413d1d44f7caf160"
+checksum = "d5348117bf44bbc63ca264cebd02fc5a1438c0f09b354784da7692ecf2c1d941"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -6366,9 +6320,9 @@ dependencies = [
 
 [[package]]
 name = "omq-tokio"
-version = "0.37.1"
+version = "0.39.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f266cc8410301e20ea96c58c355db4e2bd8b2443dee5a40c0769822a1ddd2583"
+checksum = "682d03a33f442e03bec9166b35adbb8ab28b98a633a13ac37727a4b42dbc13f1"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -9081,19 +9035,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "system-deps"
-version = "6.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3e535eb8dded36d55ec13eddacd30dec501792ff23a0b1682c38601b8cf2349"
-dependencies = [
- "cfg-expr",
- "heck",
- "pkg-config",
- "toml 0.8.23",
- "version-compare",
-]
-
-[[package]]
 name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9327,19 +9268,6 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
-
-[[package]]
-name = "tmq"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3f41ac3a42f65436eed7e1afe80dbe8a982dcac2ea4581bf61bc2d3dcfb19a1"
-dependencies = [
- "futures",
- "log",
- "thiserror 1.0.69",
- "tokio",
- "zmq",
-]
 
 [[package]]
 name = "tokenizers"
@@ -10379,12 +10307,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "version-compare"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03c2856837ef78f57382f06b2b8563a2f512f7185d732608fd9176cb3b8edf0e"
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11283,9 +11205,9 @@ dependencies = [
 
 [[package]]
 name = "yring"
-version = "0.3.21"
+version = "0.3.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbf3b929ee32afe8b4f4c47e3647071775e59bcf67e0cbbbd360d30180bf1e91"
+checksum = "d9711debb4e69f22b935b1de5a5c8d0329ec79bb9de7a585b513e39aee19eed3"
 dependencies = [
  "loom",
 ]
@@ -11336,16 +11258,6 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
-
-[[package]]
-name = "zeromq-src"
-version = "0.2.6+4.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc120b771270365d5ed0dfb4baf1005f2243ae1ae83703265cb3504070f4160b"
-dependencies = [
- "cc",
- "dircpy",
-]
 
 [[package]]
 name = "zerotrie"
@@ -11408,28 +11320,6 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[package]]
-name = "zmq"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd3091dd571fb84a9b3e5e5c6a807d186c411c812c8618786c3c30e5349234e7"
-dependencies = [
- "bitflags 1.3.2",
- "libc",
- "zmq-sys",
-]
-
-[[package]]
-name = "zmq-sys"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e8351dc72494b4d7f5652a681c33634063bbad58046c1689e75270908fdc864"
-dependencies = [
- "libc",
- "system-deps",
- "zeromq-src",
-]
 
 [[package]]
 name = "zopfli"

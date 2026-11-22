@@ -970,7 +970,7 @@ mod tests {
             .namespace(format!("direct-zmq-shared-{}", uuid::Uuid::new_v4()))?
             .component("frontend")?
             .endpoint("generate");
-        let socket = SharedZmqPublisherSocket::bind(TOPIC)?;
+        let socket = SharedZmqPublisherSocket::bind(TOPIC).await?;
         let publishers = [
             EventPublisher::for_endpoint_id_on_shared_socket(&distributed, &endpoint.id(), &socket)
                 .await?,
