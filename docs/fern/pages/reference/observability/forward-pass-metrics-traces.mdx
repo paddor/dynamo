@@ -135,7 +135,7 @@ from sampling, local queue pressure, an upstream ZMQ drop, a crash, or node loss
 `_FpmPublisherThread` publishes each `ForwardPassMetrics` message on a ZMQ `PUB` socket as a three-frame multipart (`self._pub.send_multipart((topic, seq_bytes, payload), flags=zmq.NOBLOCK)`) with an empty topic frame (`topic = b""`), an 8-byte big-endian sequence number (`seq_bytes = seq.to_bytes(8, "big")`), and the payload last. The payload is MessagePack, not the JSON used by the trace schema above: `msgspec.msgpack.Encoder().encode(...)` on the same `ForwardPassMetrics` struct from `dynamo.common.forward_pass_metrics`. Subscribe with an empty topic filter to receive every message: ZMQ `SUB` topic matching is a byte-prefix match against the first frame, and an empty filter matches unconditionally.
 
 ```python
-import zmq
+import pyomq as zmq
 from dynamo.common.forward_pass_metrics import decode
 
 ctx = zmq.Context.instance()
